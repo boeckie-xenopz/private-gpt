@@ -823,8 +823,21 @@ the same always-present default posture.
 
 **TB-TOOLS — why all tools share one boundary (and when to split it).**
 The four tool destinations (Brave search, scraped websites, remote MCP servers,
-external SQL databases) are grouped into a single boundary because they share
-the defining privacy characteristics that distinguish them from every other
+external SQL databases) are indeed each operated by a *different* provider — and
+that is exactly the reason they share one boundary rather than being drawn as
+four operator-trusted zones. A trust boundary groups zones by their trust
+*posture* toward PrivateGPT, not by their hostname. For TB-INFER the operator
+chooses one known model provider and establishes a relationship with it
+(credentials fixed in settings, a contract/DPA in principle). TB-TOOLS is the
+opposite posture: the destinations are chosen by the caller and the LLM at
+request time, so the operator has **no prior trust relationship with any of
+them and cannot even enumerate them at modelling time**. From PrivateGPT's point
+of view they therefore collapse into a single zone — *"a third party we did not
+vet, reached with credentials we did not issue, chosen by someone other than the
+operator."* The provider heterogeneity is the *content* of that one posture, not
+grounds for four separate boundaries; you cannot draw a per-provider zone for
+providers you cannot name in advance. Concretely, they are grouped because they
+share these defining characteristics that distinguish them from every other
 boundary in the model:
 
 1. **Caller/request-driven control.** Unlike TB-INFER (operator settings), the
@@ -841,21 +854,33 @@ boundary in the model:
    a return-direction crossing the other boundaries do not share.
 4. **Uniformly optional / opt-in.** None are active under default settings;
    each is gated by a feature flag or by the request supplying the trigger.
+5. **Heterogeneous, unvettable providers.** Each destination may be a different,
+   operator-unknown third party (any Brave-returned site, any MCP server URL, any
+   database connection string). This shared "could be anyone" property is itself
+   the trust posture that defines the boundary — not a reason to split it.
 
 Grouping them keeps the model honest about the fact that this *entire class* of
-egress is attacker/model-steerable, which is the single most important property
-for the threat step. That said, the grouping is a modelling convenience at this
-level of the DFD, and it is **expected to be decomposed during LINDDUN PRO**.
-Each tool has materially different data and mitigations — Brave receives only a
+egress is attacker/model-steerable toward unvetted third parties, which is the
+single most important property for the threat step. The per-provider detail is
+*not* discarded — it lives at a finer granularity: the per-flow privacy
+attributes in the [data flow catalogue](#10-data-flow-catalogue-privacy-attributes)
+(DF-07–DF-10) already record the distinct data, protocol, and credential model
+of each destination, and each *concrete instance* at run time (this specific MCP
+server, this specific database) is a distinct crossing whose actual hosting
+provider becomes a threat-relevant attribute. The single boundary is thus a
+modelling choice at the context/Level-1 views, and it is **expected to be
+decomposed during LINDDUN PRO** into four sub-boundaries (TB-TOOLS/BRAVE,
+TB-TOOLS/WEB, TB-TOOLS/MCP, TB-TOOLS/DB) — and, within TB-TOOLS/MCP and
+TB-TOOLS/DB, into per-endpoint instances — each sharing the common posture above
+but carrying materially different data and mitigations: Brave receives only a
 short query string, the scraper fetches model-supplied URLs with no credentials,
 MCP forwards LLM-generated arguments under a request-supplied bearer token, and
-the DB tool exchanges generated SQL for row data that re-enters the prompt. When
-the per-flow elicitation reaches TB-TOOLS, these should be treated as four
-sub-boundaries (TB-TOOLS/BRAVE, TB-TOOLS/WEB, TB-TOOLS/MCP, TB-TOOLS/DB) sharing
-the common properties above. They are presented together here because, at the
-context and Level-1 views, splitting them would add four near-identical boxes
-without changing the structural story; the shared "caller-steered third-party
-egress" property is what the reader needs first.
+the DB tool exchanges generated SQL for row data that re-enters the prompt. They
+are presented together here because, at the context and Level-1 views, drawing
+them (and their unbounded set of concrete provider instances) as separate zones
+would add many near-identical boxes without changing the structural story; the
+shared "caller-steered egress to an unvetted third party" posture is what the
+reader needs first.
 
 **TB-SANDBOX — a process boundary, not a network one.**
 This boundary is drawn even though it does not involve a remote service, because
