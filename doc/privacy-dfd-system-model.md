@@ -650,6 +650,59 @@ Evidence: `observability/message.py:108,131-137,150,159`; `observability/http.py
 
 ## 9. Trust boundaries
 
+### 9.1 What a trust boundary is and why it matters here
+
+A **trust boundary** is a line in the data-flow model across which the level of
+trust in the data, the code, or the operator changes. In concrete terms, a
+boundary is drawn wherever data moves between zones that differ in at least one
+of the following: who controls the execution environment, who can read or
+modify the data in transit, what authentication or authorization is enforced,
+what legal or organizational entity is responsible, or what assumptions the code
+on each side may safely make about the other.
+
+In a **LINDDUN PRO** analysis the trust boundary is the primary unit of work.
+LINDDUN PRO elicits privacy threats **per data flow at each trust-boundary
+crossing**: a flow that stays inside a single trusted zone carries far less
+privacy risk than the same flow when it crosses into a zone with different
+control, different retention, or a different responsible party. The boundaries
+therefore determine *where* the subsequent threat elicitation will focus and
+*which* threat categories (Linking, Identifying, Non-repudiation, Detecting,
+Data Disclosure, Unawareness, Non-compliance) are plausible for each crossing.
+Drawing the boundaries accurately — and justifying each one — is what makes the
+later analysis defensible rather than arbitrary.
+
+Because privacy risk is driven by *loss of control over personal data*, this
+model places a boundary wherever **control over the data changes hands**, not
+merely wherever a network hop occurs. Two services reachable over the same
+protocol can still belong to different boundaries if the party that controls
+them, the credentials used to reach them, or the retention they impose differ.
+
+### 9.2 Criteria used to draw the boundaries in this model
+
+Each boundary below is justified against an explicit, repeatable set of criteria.
+Two zones are separated into distinct boundaries when they differ on one or more
+of these axes:
+
+1. **Controlling party / responsibility** — is the far side operated by the same
+   operator as PrivateGPT, by the end user/caller, or by an independent third
+   party?
+2. **Credential provenance** — are the credentials used to cross the boundary
+   fixed by the operator (settings), forwarded from the caller, or supplied
+   per-request in the message body?
+3. **Data transformation and category** — does raw source data cross, or only
+   derived data (vectors, summaries, generated SQL)?
+4. **Direction of return flow** — does data come *back* across the boundary and
+   re-enter a more trusted zone (for example, into the model prompt)?
+5. **Isolation mechanism** — is the separation enforced by the network, by OS
+   process isolation, or only logically?
+6. **Default posture and configurability** — is the crossing always present, or
+   only when a feature is enabled or a request opts in?
+
+These criteria are what justify treating superficially similar destinations
+differently, and grouping superficially different destinations together.
+
+### 9.3 Boundary diagram
+
 ```mermaid
 flowchart TB
     CLIENT([EE-CLIENT])
@@ -662,11 +715,11 @@ flowchart TB
         end
     end
 
-    subgraph TBINFER["TB-INFER — model services (static creds)"]
+    subgraph TBINFER["TB-INFER — model services (operator creds, derived data)"]
         INFER([EE-INFERENCE])
         EMBED([EE-EMBED])
     end
-    subgraph TBPARSE["TB-PARSE — parsing (raw bytes)"]
+    subgraph TBPARSE["TB-PARSE — parsing (raw source bytes)"]
         DOCLING([EE-DOCLING])
     end
     subgraph TBTOOLS["TB-TOOLS — tool third parties (caller-supplied endpoints/creds for MCP + DB)"]
@@ -694,14 +747,130 @@ flowchart TB
     CORE -.-> OTEL
 ```
 
+### 9.4 Boundary summary
+
 | Boundary | Type | Crossing(s) | Notes |
 |---|---|---|---|
 | TB-NET | Physical / network | EE-CLIENT → P-API | Auth disabled, CORS open by default; server binds `0.0.0.0:8080` plaintext unless fronted by TLS |
-| TB-INFER | Physical / network | P-LLM → EE-INFERENCE; P-EMBED → EE-EMBED | Static settings credentials; caller Principal credentials not forwarded |
-| TB-PARSE | Physical / network | P-INGEST → EE-DOCLING | Raw document bytes (base64) |
-| TB-TOOLS | Physical / network | P-WEBSEARCH → EE-BRAVE; P-WEBFETCH → EE-WEBSITE; P-MCP → EE-MCP; P-DBQUERY → EE-EXTDB | MCP + external DB endpoints and credentials are caller-supplied per request |
+| TB-INFER | Physical / network | P-LLM → EE-INFERENCE; P-EMBED → EE-EMBED | Operator (settings) credentials; caller Principal credentials not forwarded; derived data (prompt text, vectors) |
+| TB-PARSE | Physical / network | P-INGEST → EE-DOCLING | Raw, unredacted source document bytes (base64) |
+| TB-TOOLS | Physical / network | P-WEBSEARCH → EE-BRAVE; P-WEBFETCH → EE-WEBSITE; P-MCP → EE-MCP; P-DBQUERY → EE-EXTDB | MCP + external DB endpoints and credentials are caller-supplied per request; several flows return data into the prompt |
 | TB-SANDBOX | Logical / process | P-CODEEXEC → host subprocess | rlimit isolation; no network isolation; `internet_enabled` advisory only for local provider |
 | TB-STORAGE | Physical / network | P-FILES → EE-S3; P-SCHED → EE-BROKER; P-OBS → EE-OTEL | Config-gated |
+
+### 9.5 Motivation for each boundary
+
+The following subsections justify each boundary against the criteria in
+section 9.2, and explicitly address why certain destinations are separated and
+others grouped.
+
+**TB-NET — the client/API boundary.**
+This is the outermost boundary: everything the operator runs sits inside it, and
+the caller sits outside. It is drawn here because *responsibility and control
+change completely* at this line — the caller is an untrusted party whose input
+is attacker-controllable. It is a distinct boundary from all the others because
+it is the only place where data *enters* the system from an external data
+subject, and because its default posture (authentication disabled, CORS open,
+plaintext bind) makes it the highest-leverage boundary for Unawareness,
+Data Disclosure, and Non-compliance threats. Criteria matched: controlling
+party, credential provenance, isolation mechanism.
+
+**TB-INFER and TB-PARSE — why these are two boundaries, not one.**
+At first glance both are "PrivateGPT calls an HTTP service over the network," so
+it is reasonable to ask why they are separated. They are distinct because they
+differ on the two criteria that matter most for privacy — *the category of data
+that crosses* and *the purpose and controlling party* — not merely on protocol:
+
+- **TB-PARSE carries raw, unredacted source documents.** The Docling reader
+  ships the *entire original file* as base64 (`components/readers/docling/api_clients.py:313-343`).
+  Whatever personal data exists in the source — names, identifiers, embedded
+  images, tables — leaves in its original, fully-identifying form. The parsing
+  service is a *document-processing* party whose purpose is extraction.
+- **TB-INFER carries derived or query data for a different purpose.** The
+  inference and embedding services receive prompts, message history, retrieved
+  chunks, and vectors (`components/engines/chat/async_chat_engine.py:1127`,
+  `components/embedding/factories/openailike.py:27`) for the purpose of
+  *generation and similarity*. The data has typically already been transformed
+  (chunked, embedded, assembled into a prompt), and the controlling party is a
+  model provider.
+
+Keeping them separate lets the LINDDUN PRO step reason about them differently:
+TB-PARSE is dominated by Identifying/Data-Disclosure threats over *raw* personal
+data (minimization and purpose-limitation questions apply directly), whereas
+TB-INFER raises Linking and Detecting threats tied to prompt/response content
+and to a model provider's logging and retention. Collapsing them would hide the
+fact that the *most sensitive* egress (raw files) and the *most voluminous*
+egress (prompts) have different data subjects' exposure, different mitigations
+(redaction vs. prompt minimization), and potentially different legal bases.
+EE-EMBED is grouped *with* EE-INFERENCE under TB-INFER — not split out — because
+they share all six criteria: same operator-supplied credential model, same
+derived-data category, same "model service" controlling-party class, and the
+same always-present default posture.
+
+**TB-TOOLS — why all tools share one boundary (and when to split it).**
+The four tool destinations (Brave search, scraped websites, remote MCP servers,
+external SQL databases) are grouped into a single boundary because they share
+the defining privacy characteristics that distinguish them from every other
+boundary in the model:
+
+1. **Caller/request-driven control.** Unlike TB-INFER (operator settings), the
+   *endpoint and credentials* for MCP and external DB are supplied **in the
+   request body**, not in operator configuration
+   (`server/chat/chat_models.py:34-37`, `server/utils/artifact_input.py:168-215`).
+   The caller, not the operator, chooses where data goes.
+2. **Model-directed egress.** What leaves is chosen by the LLM mid-turn (tool
+   arguments, a generated SQL query, a URL to fetch), so the operator cannot
+   predict the destination or payload at configuration time.
+3. **Return flow into a trusted zone.** Several of these flows send data *back*
+   into the prompt — notably external-DB rows are sampled back into the model
+   context (`components/tabular/database_query_generator.py:947-988`) — which is
+   a return-direction crossing the other boundaries do not share.
+4. **Uniformly optional / opt-in.** None are active under default settings;
+   each is gated by a feature flag or by the request supplying the trigger.
+
+Grouping them keeps the model honest about the fact that this *entire class* of
+egress is attacker/model-steerable, which is the single most important property
+for the threat step. That said, the grouping is a modelling convenience at this
+level of the DFD, and it is **expected to be decomposed during LINDDUN PRO**.
+Each tool has materially different data and mitigations — Brave receives only a
+short query string, the scraper fetches model-supplied URLs with no credentials,
+MCP forwards LLM-generated arguments under a request-supplied bearer token, and
+the DB tool exchanges generated SQL for row data that re-enters the prompt. When
+the per-flow elicitation reaches TB-TOOLS, these should be treated as four
+sub-boundaries (TB-TOOLS/BRAVE, TB-TOOLS/WEB, TB-TOOLS/MCP, TB-TOOLS/DB) sharing
+the common properties above. They are presented together here because, at the
+context and Level-1 views, splitting them would add four near-identical boxes
+without changing the structural story; the shared "caller-steered third-party
+egress" property is what the reader needs first.
+
+**TB-SANDBOX — a process boundary, not a network one.**
+This boundary is drawn even though it does not involve a remote service, because
+*the isolation mechanism and the trust assumption change*: LLM-generated code
+runs in a host subprocess under resource limits
+(`components/code_execution/bash_executor.py:87-106`). It is separated from
+TB-NET because the code inside it is *model-authored and untrusted*, yet it runs
+with the server process's ambient authority and **no network isolation**
+(`internet_enabled` is advisory only for the local provider,
+`components/prompts/prompt_builder.py:572-594`). It is a logical/process boundary
+rather than a physical one, which is itself a privacy-relevant fact: data does
+not need to leave the host to be mishandled here. Criteria matched: isolation
+mechanism, controlling party (model-authored code), direction (can read local
+files and session data).
+
+**TB-STORAGE — operator-controlled persistence, grouped by shared posture.**
+Object storage (S3), the broker (Redis/RabbitMQ), and the trace sink
+(OpenTelemetry/JSONL) are grouped because they share the defining
+characteristics of an *operator-controlled persistence zone*: all are
+configured by the operator, all are config-gated (inactive under defaults), and
+all concern *data at rest* and retention rather than live request processing.
+They are separated from TB-INFER/TB-PARSE/TB-TOOLS because their privacy
+questions are about retention, deletion, and secondary use — the trace sink in
+particular can persist full prompts and completions when enabled
+(`observability/exporters.py:63-120`). As with TB-TOOLS, this group may be
+decomposed during elicitation if a deployment enables only a subset, since the
+trace sink (high-sensitivity content capture) raises different threats from the
+broker (transient, TTL-bounded event data).
+
 
 ---
 
