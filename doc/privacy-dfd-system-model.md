@@ -752,7 +752,7 @@ flowchart TB
 | Boundary | Type | Crossing(s) | Notes |
 |---|---|---|---|
 | TB-NET | Physical / network | EE-CLIENT → P-API | Auth disabled, CORS open by default; server binds `0.0.0.0:8080` plaintext unless fronted by TLS |
-| TB-INFER | Physical / network | P-LLM → EE-INFERENCE; P-EMBED → EE-EMBED | Operator (settings) credentials; caller Principal credentials not forwarded; derived data (prompt text, vectors) |
+| TB-INFER | Physical / network | P-LLM → EE-INFERENCE; P-EMBED → EE-EMBED | Operator (settings) credentials; caller Principal credentials not forwarded; carries conversational text (incl. verbatim user prompts), retrieved chunks, and vectors |
 | TB-PARSE | Physical / network | P-INGEST → EE-DOCLING | Raw, unredacted source document bytes (base64) |
 | TB-TOOLS | Physical / network | P-WEBSEARCH → EE-BRAVE; P-WEBFETCH → EE-WEBSITE; P-MCP → EE-MCP; P-DBQUERY → EE-EXTDB | MCP + external DB endpoints and credentials are caller-supplied per request; several flows return data into the prompt |
 | TB-SANDBOX | Logical / process | P-CODEEXEC → host subprocess | rlimit isolation; no network isolation; `internet_enabled` advisory only for local provider |
@@ -777,35 +777,49 @@ party, credential provenance, isolation mechanism.
 
 **TB-INFER and TB-PARSE — why these are two boundaries, not one.**
 At first glance both are "PrivateGPT calls an HTTP service over the network," so
-it is reasonable to ask why they are separated. They are distinct because they
-differ on the two criteria that matter most for privacy — *the category of data
-that crosses* and *the purpose and controlling party* — not merely on protocol:
+it is reasonable to ask why they are separated. Note first what does **not**
+distinguish them: it is tempting to say TB-INFER carries only "derived" data,
+but that is inaccurate — a user's prompt is largely the *verbatim* text they
+typed, i.e. raw personal data, and it crosses TB-INFER unmodified. Both
+boundaries can therefore carry fully-identifying raw personal data. What
+actually separates them is the **controlling party and processing purpose**, the
+**kind of content** that crosses, and the **data subject's likely awareness** of
+the crossing:
 
-- **TB-PARSE carries raw, unredacted source documents.** The Docling reader
-  ships the *entire original file* as base64 (`components/readers/docling/api_clients.py:313-343`).
-  Whatever personal data exists in the source — names, identifiers, embedded
-  images, tables — leaves in its original, fully-identifying form. The parsing
-  service is a *document-processing* party whose purpose is extraction.
-- **TB-INFER carries derived or query data for a different purpose.** The
-  inference and embedding services receive prompts, message history, retrieved
-  chunks, and vectors (`components/engines/chat/async_chat_engine.py:1127`,
-  `components/embedding/factories/openailike.py:27`) for the purpose of
-  *generation and similarity*. The data has typically already been transformed
-  (chunked, embedded, assembled into a prompt), and the controlling party is a
-  model provider.
+- **TB-PARSE is a document-extraction party that receives whole original
+  files.** The Docling reader ships the *entire original file* as base64
+  (`components/readers/docling/api_clients.py:313-343`) — including embedded
+  images, scanned pages, tables, and document structure. The purpose is
+  *extraction*, the controlling party is a document-processing service, and the
+  disclosure surface is the complete source artifact, much of which (metadata,
+  embedded media, hidden fields) a user may not realize is contained in the file
+  at all.
+- **TB-INFER is a model-service party that receives conversational and query
+  content.** The inference and embedding services receive the assembled prompt
+  — which includes the *verbatim user message* alongside the system prompt,
+  message history, and any retrieved RAG chunks — plus embedding vectors
+  (`components/engines/chat/async_chat_engine.py:1127`,
+  `components/embedding/factories/openailike.py:27`), for the purpose of
+  *generation and similarity*. The data category is chat/text and vectors rather
+  than whole files, and the controlling party is a model provider with its own
+  logging and retention regime. The RAG chunks and vectors are derived, but the
+  user's own prompt text is not — so this boundary is separated by *party,
+  purpose, and content kind*, not by any claim that its data is less raw.
 
 Keeping them separate lets the LINDDUN PRO step reason about them differently:
-TB-PARSE is dominated by Identifying/Data-Disclosure threats over *raw* personal
-data (minimization and purpose-limitation questions apply directly), whereas
-TB-INFER raises Linking and Detecting threats tied to prompt/response content
-and to a model provider's logging and retention. Collapsing them would hide the
-fact that the *most sensitive* egress (raw files) and the *most voluminous*
-egress (prompts) have different data subjects' exposure, different mitigations
-(redaction vs. prompt minimization), and potentially different legal bases.
+TB-PARSE is dominated by Identifying/Data-Disclosure and Unawareness threats over
+*whole-document* personal data (minimization and purpose-limitation questions
+apply directly, and the user may be unaware the full file is forwarded), whereas
+TB-INFER raises Linking and Detecting threats tied to prompt/response content and
+to a model provider's logging and retention. Both can carry raw personal data;
+collapsing them would nonetheless hide that the whole-file egress and the
+conversational egress have different data subjects' exposure, different
+mitigations (document redaction vs. prompt minimization), and potentially
+different legal bases and processors.
 EE-EMBED is grouped *with* EE-INFERENCE under TB-INFER — not split out — because
-they share all six criteria: same operator-supplied credential model, same
-derived-data category, same "model service" controlling-party class, and the
-same always-present default posture.
+they share the distinguishing criteria: same operator-supplied credential model,
+same "model service" controlling-party class, same text/vector content kind, and
+the same always-present default posture.
 
 **TB-TOOLS — why all tools share one boundary (and when to split it).**
 The four tool destinations (Brave search, scraped websites, remote MCP servers,
