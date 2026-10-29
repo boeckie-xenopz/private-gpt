@@ -426,29 +426,54 @@ data_stores:
     status: implemented-default-on
 
 # ----------------------------------------------------------------------------
+# profiles: P0 = default/demo (shipped); P1 = hardened single-tenant
+# (auth on, TLS, co-located model); P2 = target multi-tenant (aspirational).
 trust_boundaries:
   - id: TB-NET
     type: physical/network
     name: Client <-> PrivateGPT API boundary
-    notes: "Auth disabled by default; CORS wide open by default."
+    profiles: "all (posture varies)"
+    notes: "P0: auth disabled, CORS open, plaintext. P1/P2: auth (shared secret) + TLS. Server-level only."
+  - id: TB-USER
+    type: logical/intra-system
+    name: Inter-user / inter-tenant isolation inside the system
+    profiles: "P2 (ASPIRATIONAL - not enforced by current code)"
+    notes: >
+      No code binds caller identity to a data scope. collection is a
+      request-supplied filter, not access control
+      (components/vector_store/vector_store_component.py:101-105); Principal is
+      never used to authorize collection/tenant access. Enabling auth does NOT
+      create this boundary (single shared secret, one zone).
   - id: TB-INFER
     type: physical/network
     name: PrivateGPT <-> external inference/embedding boundary
+    profiles: "P0: organizational (third party). P1/P2: co-located -> process/network only."
     notes: "Static settings credentials; caller Principal creds NOT forwarded."
   - id: TB-PARSE
     type: physical/network
     name: PrivateGPT <-> Docling parse boundary (raw bytes)
+    profiles: "P0: localhost sidecar (process); organizational if api_base remote."
   - id: TB-TOOLS
     type: physical/network
     name: PrivateGPT <-> tool third parties (Brave, websites, MCP, external DB)
+    profiles: "all when enabled (off in P0 defaults)"
     notes: "MCP + external DB endpoints/credentials are CALLER-SUPPLIED per request."
   - id: TB-SANDBOX
     type: logical/process
     name: Orchestrator <-> code-execution sandbox (local subprocess)
+    profiles: all
     notes: "rlimit-isolated but NO network isolation; internet_enabled advisory only."
+  - id: TB-LOCAL-STORE
+    type: logical/data-at-rest
+    name: Local data-at-rest inside the core (on-disk Qdrant, files, traces, logs)
+    profiles: "P0/P1 (default local persistence)"
+    notes: >
+      Adversary is host/operator (admin-as-adversary); concerns are retention,
+      deletion, secondary use. Becomes TB-STORAGE when externalized.
   - id: TB-STORAGE
     type: physical/network
-    name: PrivateGPT <-> object storage / broker / trace sink
+    name: PrivateGPT <-> externalized object storage / broker / trace sink
+    profiles: "config-gated (off in P0 defaults)"
     status: config-gated
 
 unresolved:
@@ -697,25 +722,83 @@ of these axes:
    process isolation, or only logically?
 6. **Default posture and configurability** — is the crossing always present, or
    only when a feature is enabled or a request opts in?
+7. **Subject/tenant separation** — does the data of one user or tenant cross into
+   a zone where another user's or tenant's data lives, without an enforced
+   control keeping them apart?
 
 These criteria are what justify treating superficially similar destinations
 differently, and grouping superficially different destinations together.
 
-### 9.3 Boundary diagram
+### 9.3 Why this model is configuration-relative, and the deployment profiles used
+
+Trust boundaries are not an intrinsic property of the source code; they depend on
+*how the software is deployed and configured*. The same call can be an
+organizational trust-boundary crossing in one deployment and an entirely
+internal flow in another. Three examples drawn from reviewer feedback:
+
+- With the shipped `openai.api_base`, TB-INFER crosses to a third-party model
+  provider. In a deployment that points PrivateGPT at a **co-located local
+  model server** (e.g. vLLM on the same host/cluster, same operator), the
+  "controlling party" criterion is no longer met and TB-INFER ceases to be an
+  *organizational* boundary (it may remain a process/network boundary).
+- Authentication is off by default, so the caller→API boundary is wide open. A
+  hardened deployment enables auth and TLS, which changes that boundary's
+  posture.
+- Local stores (on-disk Qdrant, uploaded files, `traces.jsonl`) sit inside the
+  core by default but can be externalized to S3/OTEL, which turns an internal
+  data-at-rest concern into a network crossing.
+
+Rather than pin the analysis to a single configuration, this model is organized
+around a small set of **named deployment profiles**. Boundaries and flows are
+then annotated with how they behave under each profile. This matches how
+LINDDUN PRO treats trust assumptions: the assumptions are made explicit and
+varied, instead of being baked silently into one diagram.
+
+> **Why still document the shipped default?** It is the one configuration that is
+> unambiguously "what the software does out of the box" and is therefore the
+> reference/control case against which hardening and target deployments are
+> compared. It is a baseline, not necessarily the deployment that will be
+> analyzed for production risk.
+
+**Profiles used in this document:**
+
+| Profile | Description | Key config deltas vs default |
+|---|---|---|
+| **P0 — Default / demo** (shipped) | The configuration in `settings.yaml` as cloned. Reference/control case. | auth off; CORS open; local on-disk stores; `openai.api_base` = third party; observability off; schedulers local; broker memory |
+| **P1 — Hardened single-tenant** | One trusted operator, one tenant, locked down for a pilot or internal deployment. | auth **on** (shared secret); TLS terminated in front; `openai.api_base` → **co-located local vLLM** (same operator); observability off or local-only; CORS restricted |
+| **P2 — Target multi-tenant** | Multiple independent tenants/users served by one deployment, requiring data isolation between them. **Aspirational — not enforced by the current codebase (see 9.6).** | P1 + per-tenant/collection access control binding caller identity to data scope |
+
+Each boundary's summary row (9.5) and motivation (9.6) notes how it changes
+across P0/P1/P2. A boundary that exists only under a given profile is labelled
+accordingly; a boundary that is *required* by a profile but not implemented is
+labelled **aspirational**.
+
+### 9.4 Boundary diagram
+
+Legend: solid = always-present / default-on crossing; dotted = config-gated or
+request-driven; the dashed **TB-USER** box is an *aspirational* boundary not
+enforced by current code.
 
 ```mermaid
 flowchart TB
     CLIENT([EE-CLIENT])
 
-    subgraph TBNET["TB-NET — client/API boundary (auth OFF, CORS open by default)"]
+    subgraph TBNET["TB-NET — client/API boundary (P0: auth OFF, CORS open; P1/P2: auth+TLS)"]
         direction TB
-        CORE["PrivateGPT orchestration"]
-        subgraph TBSANDBOX["TB-SANDBOX — code-exec subprocess (rlimits, no net isolation)"]
-            CE["P-CODEEXEC"]
+        subgraph TBUSER["TB-USER — inter-user / tenant isolation (P2, ASPIRATIONAL — not enforced)"]
+            CORE["PrivateGPT orchestration"]
+            subgraph TBLOCAL["TB-LOCAL-STORE — local data-at-rest (admin-as-adversary)"]
+                QD[("on-disk Qdrant / index JSON")]
+                FILES[("uploaded & session files")]
+                TRACES[("traces.jsonl / logs")]
+            end
+            subgraph TBSANDBOX["TB-SANDBOX — code-exec subprocess (rlimits, no net isolation)"]
+                CE["P-CODEEXEC"]
+            end
         end
     end
 
-    subgraph TBINFER["TB-INFER — model services (operator creds, derived data)"]
+    subgraph TBINFER["TB-INFER — model services (P0: third party; P1/P2: co-located)"]
         INFER([EE-INFERENCE])
         EMBED([EE-EMBED])
     end
@@ -728,13 +811,16 @@ flowchart TB
         MCP([EE-MCP])
         EXTDB([EE-EXTDB])
     end
-    subgraph TBSTORAGE["TB-STORAGE — storage/broker/traces (config-gated)"]
+    subgraph TBSTORAGE["TB-STORAGE — externalized storage/broker/traces (config-gated)"]
         S3([EE-S3])
         BROKER([EE-BROKER])
         OTEL([EE-OTEL])
     end
 
     CLIENT --> CORE
+    CORE --> QD
+    CORE --> FILES
+    CORE -.-> TRACES
     CORE --> INFER
     CORE --> EMBED
     CORE --> DOCLING
@@ -747,18 +833,25 @@ flowchart TB
     CORE -.-> OTEL
 ```
 
-### 9.4 Boundary summary
+### 9.5 Boundary summary
 
-| Boundary | Type | Crossing(s) | Notes |
-|---|---|---|---|
-| TB-NET | Physical / network | EE-CLIENT → P-API | Auth disabled, CORS open by default; server binds `0.0.0.0:8080` plaintext unless fronted by TLS |
-| TB-INFER | Physical / network | P-LLM → EE-INFERENCE; P-EMBED → EE-EMBED | Operator (settings) credentials; caller Principal credentials not forwarded; carries conversational text (incl. verbatim user prompts), retrieved chunks, and vectors |
-| TB-PARSE | Physical / network | P-INGEST → EE-DOCLING | Raw, unredacted source document bytes (base64) |
-| TB-TOOLS | Physical / network | P-WEBSEARCH → EE-BRAVE; P-WEBFETCH → EE-WEBSITE; P-MCP → EE-MCP; P-DBQUERY → EE-EXTDB | MCP + external DB endpoints and credentials are caller-supplied per request; several flows return data into the prompt |
-| TB-SANDBOX | Logical / process | P-CODEEXEC → host subprocess | rlimit isolation; no network isolation; `internet_enabled` advisory only for local provider |
-| TB-STORAGE | Physical / network | P-FILES → EE-S3; P-SCHED → EE-BROKER; P-OBS → EE-OTEL | Config-gated |
+The **Profile** column shows where the boundary is an *organizational / trust*
+crossing: `P0` default, `P1` hardened single-tenant, `P2` target multi-tenant.
+"all" = present in every profile; "aspirational" = required by the profile but
+**not enforced by the current code**.
 
-### 9.5 Motivation for each boundary
+| Boundary | Type | Crossing(s) | Profile | Notes |
+|---|---|---|---|---|
+| TB-NET | Physical / network | EE-CLIENT → P-API | all (posture varies) | **P0:** open — auth disabled, CORS open, plaintext `0.0.0.0:8080`. **P1/P2:** authenticated (shared secret) + TLS. Server-level only — see TB-USER |
+| TB-USER | Logical (intra-system) | caller A's data ↔ caller B's data inside P-API/stores | **P2 (aspirational)** | No code binds caller identity to a data scope. `collection` is a request-supplied **filter**, not access control (`components/vector_store/vector_store_component.py:101-105`); `Principal` is never used to authorize collection/tenant access. Enabling auth does **not** create this boundary (one shared secret, one zone) |
+| TB-INFER | Physical / network | P-LLM → EE-INFERENCE; P-EMBED → EE-EMBED | **P0:** organizational (third-party provider). **P1/P2:** co-located local model → process/network boundary only, not organizational | Operator (settings) credentials; caller Principal credentials not forwarded; carries conversational text (incl. verbatim user prompts), retrieved chunks, and vectors |
+| TB-PARSE | Physical / network | P-INGEST → EE-DOCLING | **P0:** localhost sidecar (process boundary); organizational if `api_base` is remote. **P1/P2:** co-located | Raw, unredacted source document bytes (base64) |
+| TB-TOOLS | Physical / network | P-WEBSEARCH → EE-BRAVE; P-WEBFETCH → EE-WEBSITE; P-MCP → EE-MCP; P-DBQUERY → EE-EXTDB | all when enabled (off in P0 defaults) | MCP + external DB endpoints and credentials are caller-supplied per request; several flows return data into the prompt |
+| TB-SANDBOX | Logical / process | P-CODEEXEC → host subprocess | all | rlimit isolation; no network isolation; `internet_enabled` advisory only for local provider |
+| TB-LOCAL-STORE | Logical (data-at-rest) | P-* → on-disk Qdrant, index JSON, uploaded/session files, `traces.jsonl`, logs | **P0/P1** (default persistence) | Data at rest *inside* the core under shipped defaults. Operator/admin has full read access; concerns are retention, deletion, and **admin-as-adversary** rather than network egress. Becomes TB-STORAGE when externalized |
+| TB-STORAGE | Physical / network | P-FILES → EE-S3; P-SCHED → EE-BROKER; P-OBS → EE-OTEL | config-gated (off in P0 defaults) | Externalized persistence; organizational crossing if the storage/broker/trace backend is a different party |
+
+### 9.6 Motivation for each boundary
 
 The following subsections justify each boundary against the criteria in
 section 9.2, and explicitly address why certain destinations are separated and
@@ -774,6 +867,42 @@ subject, and because its default posture (authentication disabled, CORS open,
 plaintext bind) makes it the highest-leverage boundary for Unawareness,
 Data Disclosure, and Non-compliance threats. Criteria matched: controlling
 party, credential provenance, isolation mechanism.
+
+**TB-USER — the missing inter-user / inter-tenant boundary (aspirational).**
+TB-NET controls whether a caller may reach the API *at all*; it says nothing
+about keeping one caller's data separate from another's *once inside*. Those are
+different boundaries, and conflating them is a common modelling error. Under
+every configuration the current code supports, there is **no enforced boundary
+between users or tenants inside the system**:
+
+- `collection` is supplied in the request body and is used only as a metadata
+  *filter* on retrieval (`components/vector_store/vector_store_component.py:101-105`)
+  or a Qdrant `group_id` (`components/vector_store/qdrant_factory.py:80`). Any
+  caller may name any collection; nothing checks that the caller "owns" it.
+- The `Principal` (captured caller headers/cookies) is never consulted to
+  authorize which collection, artifact, or session a caller may read or write —
+  its only data-path use is injecting credentials into code-exec subprocesses.
+- **Enabling authentication does not create this boundary.** The auth mechanism
+  is a single shared secret compared with `secrets.compare_digest` against
+  `server.auth.secret` (`server/utils/auth.py`). It is server-level: every
+  authenticated caller presents the *same* secret and lands in the *same* zone.
+  It answers "may this request talk to the API?" not "whose data is this?".
+
+Three postures result, and only the third provides inter-user separation:
+
+| Posture | TB-NET (caller→API) | TB-USER (A vs B) |
+|---|---|---|
+| Auth off (P0 default) | none | none |
+| Auth on, shared secret (P1) | present (server-level) | **still none** |
+| Per-tenant isolation (P2) | present | present — **not implemented** |
+
+TB-USER is therefore drawn as an **aspirational** boundary: it is the boundary a
+multi-tenant deployment (P2) *requires*, but which no code path currently
+enforces. Recording it explicitly is itself a finding (it maps to Linking,
+Identifying, and Data-Disclosure threats between data subjects), and it is
+exactly where a **collection-isolation test** belongs — such a test would assert
+that caller B cannot read or filter into caller A's collection, and today it
+would fail by design.
 
 **TB-INFER and TB-PARSE — why these are two boundaries, not one.**
 At first glance both are "PrivateGPT calls an HTTP service over the network," so
@@ -896,12 +1025,32 @@ not need to leave the host to be mishandled here. Criteria matched: isolation
 mechanism, controlling party (model-authored code), direction (can read local
 files and session data).
 
-**TB-STORAGE — operator-controlled persistence, grouped by shared posture.**
+**TB-LOCAL-STORE — default data-at-rest inside the core (admin-as-adversary).**
+Under the shipped defaults (P0) and a hardened single-tenant deployment (P1),
+persistence is *local*: the on-disk Qdrant store (`local_data/qdrant/`), index
+JSON, uploaded and session files, application logs, and — when observability is
+on — `local_data/traces/traces.jsonl`. These do not cross a network, so they are
+easy to overlook, but they are a genuine boundary for privacy because the
+*trust question changes*: the relevant adversary is not a remote third party but
+anyone with host/filesystem or operator access (the **admin-as-adversary**), and
+the relevant threats are **retention, deletion, and secondary use** rather than
+transmission. This boundary is where questions like "is a deleted artifact
+actually erased from Qdrant and the index JSON?", "how long do traces persist?",
+and "who can read the uploads directory?" are posed. It is drawn as a
+logical data-at-rest boundary distinct from TB-STORAGE because the data stays on
+the operator's own host; if the same data is externalized (S3/OTEL), the
+crossing migrates to TB-STORAGE and additionally becomes a network — and
+possibly organizational — boundary. Criteria matched: controlling party
+(operator/admin), default posture, and (for the trace sink) data category.
+
+**TB-STORAGE — externalized persistence, grouped by shared posture.**
 Object storage (S3), the broker (Redis/RabbitMQ), and the trace sink
 (OpenTelemetry/JSONL) are grouped because they share the defining
-characteristics of an *operator-controlled persistence zone*: all are
-configured by the operator, all are config-gated (inactive under defaults), and
-all concern *data at rest* and retention rather than live request processing.
+characteristics of an *externalized, operator-controlled persistence zone*: all
+are configured by the operator, all are config-gated (inactive under defaults),
+and all concern *data at rest* and retention rather than live request
+processing. They are the externalized counterpart to TB-LOCAL-STORE: the same
+categories of data, but now leaving the host.
 They are separated from TB-INFER/TB-PARSE/TB-TOOLS because their privacy
 questions are about retention, deletion, and secondary use — the trace sink in
 particular can persist full prompts and completions when enabled
