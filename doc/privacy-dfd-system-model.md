@@ -39,6 +39,7 @@ Key structural findings that shape the model:
 - **Several high-reach flows are caller-driven, not operator-configured.** MCP tool servers and external SQL databases are specified **per request** — the caller supplies both the endpoint and the credentials, and query results re-enter the model prompt.
 - **A rich set of optional egress and logging surfaces is disabled by default** (web search, web fetch, OpenTelemetry trace capture, Celery/S3 workers). When enabled, the trace sink captures full prompts, completions, retrieved context, and document previews.
 - **Code execution runs as a local host subprocess** with resource limits but **no network isolation**; the `internet_enabled` flag is advisory only for the bundled local provider.
+- **Trust boundaries are modelled along two orthogonal axes** (section 9.3): *configuration* (which flows exist and how the caller boundary is enforced) and *deployment topology* (where each destination is hosted and therefore whether a crossing is internal or an organizational third-party boundary). Named scenarios (S0 default, S1 self-hosted, S1′ cloud-backed, S2 multi-tenant) compose the two. Two boundaries are internal: **TB-LOCAL-STORE** (default on-disk data-at-rest, admin-as-adversary) and **TB-USER** (inter-user/tenant isolation — *aspirational, not enforced by current code*).
 
 Every element in this model is backed by a source file and line reference. Configuration-dependent and unverified items are explicitly flagged.
 
@@ -101,6 +102,8 @@ This model was produced by:
 ---
 
 ## 4. Default security and privacy posture
+
+This section describes the **configuration axis** at its shipped default — i.e. scenario **S0** in the two-axis model of section 9.3. It is the control case; sections 9.3.1–9.3.2 show how each setting and each deployment-topology choice moves the boundaries away from this baseline.
 
 The shipped `settings.yaml` establishes the default posture. Note that several environment-variable-driven defaults in `settings.yaml` **differ from the Pydantic schema defaults** in `private_gpt/settings/settings.py`; this model uses the `settings.yaml` values as the effective default.
 
@@ -426,18 +429,19 @@ data_stores:
     status: implemented-default-on
 
 # ----------------------------------------------------------------------------
-# profiles: P0 = default/demo (shipped); P1 = hardened single-tenant
-# (auth on, TLS, co-located model); P2 = target multi-tenant (aspirational).
+# scenarios (9.3.3): S0 = default/demo (shipped); S1 = hardened fully
+# self-hosted; S1′ = hardened cloud-backed; S2 = target multi-tenant (aspirational).
+# "profiles" below = scenario applicability.
 trust_boundaries:
   - id: TB-NET
     type: physical/network
     name: Client <-> PrivateGPT API boundary
     profiles: "all (posture varies)"
-    notes: "P0: auth disabled, CORS open, plaintext. P1/P2: auth (shared secret) + TLS. Server-level only."
+    notes: "S0: auth disabled, CORS open, plaintext. S1/S1′/S2: auth (shared secret) + TLS. Server-level only."
   - id: TB-USER
     type: logical/intra-system
     name: Inter-user / inter-tenant isolation inside the system
-    profiles: "P2 (ASPIRATIONAL - not enforced by current code)"
+    profiles: "S2 (ASPIRATIONAL - not enforced by current code)"
     notes: >
       No code binds caller identity to a data scope. collection is a
       request-supplied filter, not access control
@@ -447,16 +451,16 @@ trust_boundaries:
   - id: TB-INFER
     type: physical/network
     name: PrivateGPT <-> external inference/embedding boundary
-    profiles: "P0: organizational (third party). P1/P2: co-located -> process/network only."
+    profiles: "topology-dependent: S0/S1′ cloud = organizational; S1 co-located = process/network only."
     notes: "Static settings credentials; caller Principal creds NOT forwarded."
   - id: TB-PARSE
     type: physical/network
     name: PrivateGPT <-> Docling parse boundary (raw bytes)
-    profiles: "P0: localhost sidecar (process); organizational if api_base remote."
+    profiles: "topology-dependent: localhost sidecar = process; remote api_base = organizational."
   - id: TB-TOOLS
     type: physical/network
     name: PrivateGPT <-> tool third parties (Brave, websites, MCP, external DB)
-    profiles: "all when enabled (off in P0 defaults)"
+    profiles: "all scenarios when enabled (off in S0 defaults)"
     notes: "MCP + external DB endpoints/credentials are CALLER-SUPPLIED per request."
   - id: TB-SANDBOX
     type: logical/process
@@ -466,14 +470,14 @@ trust_boundaries:
   - id: TB-LOCAL-STORE
     type: logical/data-at-rest
     name: Local data-at-rest inside the core (on-disk Qdrant, files, traces, logs)
-    profiles: "P0/P1 (default local persistence)"
+    profiles: "S0/S1 (local persistence); migrates to TB-STORAGE under cloud topology"
     notes: >
       Adversary is host/operator (admin-as-adversary); concerns are retention,
       deletion, secondary use. Becomes TB-STORAGE when externalized.
   - id: TB-STORAGE
     type: physical/network
     name: PrivateGPT <-> externalized object storage / broker / trace sink
-    profiles: "config-gated (off in P0 defaults)"
+    profiles: "config-gated (off in S0 defaults); organizational under cloud topology"
     status: config-gated
 
 unresolved:
@@ -729,49 +733,99 @@ of these axes:
 These criteria are what justify treating superficially similar destinations
 differently, and grouping superficially different destinations together.
 
-### 9.3 Why this model is configuration-relative, and the deployment profiles used
+### 9.3 Two orthogonal axes: configuration and deployment topology
 
 Trust boundaries are not an intrinsic property of the source code; they depend on
-*how the software is deployed and configured*. The same call can be an
-organizational trust-boundary crossing in one deployment and an entirely
-internal flow in another. Three examples drawn from reviewer feedback:
+*how the software is configured* **and** *where the services it talks to are
+placed*. These are two different axes, and conflating them hides exactly the
+privacy question this project needs answered — "what does choosing a cloud LLM
+(or a cloud vector DB, or a cloud object store) do to our privacy exposure?".
+This model therefore treats them separately and composes them only at the end.
 
-- With the shipped `openai.api_base`, TB-INFER crosses to a third-party model
-  provider. In a deployment that points PrivateGPT at a **co-located local
-  model server** (e.g. vLLM on the same host/cluster, same operator), the
-  "controlling party" criterion is no longer met and TB-INFER ceases to be an
-  *organizational* boundary (it may remain a process/network boundary).
-- Authentication is off by default, so the caller→API boundary is wide open. A
-  hardened deployment enables auth and TLS, which changes that boundary's
-  posture.
-- Local stores (on-disk Qdrant, uploaded files, `traces.jsonl`) sit inside the
-  core by default but can be externalized to S3/OTEL, which turns an internal
-  data-at-rest concern into a network crossing.
+- **Configuration axis** — behaviour selected in `settings.yaml` / env vars
+  within one running instance: `server.auth.enabled`, CORS, `web_search.enabled`,
+  `web_fetch.enabled`, `observability.mode` + `capture_content`,
+  `scheduler.*.mode`, `vectorstore.multitenancy`, etc. Configuration decides
+  **which flows exist** and **what posture a crossing has** (e.g. authenticated
+  vs. open), but not where a destination physically sits.
+- **Deployment / topology axis** — *where* each external destination is hosted
+  and *who operates it*: is the LLM `api.openai.com` (third-party SaaS) or a
+  co-located vLLM (same operator)? Is Qdrant embedded on-disk, a self-hosted
+  cluster, or Qdrant Cloud? Is object storage AWS S3 or an in-cluster MinIO?
+  Deployment decides **whether a crossing is internal, same-operator-network, or
+  an organizational boundary to a third party** — which is the single biggest
+  determinant of where personal data physically goes and which
+  processor/sub-processor relationships (and DPAs) are required.
 
-Rather than pin the analysis to a single configuration, this model is organized
-around a small set of **named deployment profiles**. Boundaries and flows are
-then annotated with how they behave under each profile. This matches how
-LINDDUN PRO treats trust assumptions: the assumptions are made explicit and
-varied, instead of being baked silently into one diagram.
+The relationship is: **configuration determines which flows and
+destination-roles exist; deployment determines where each destination sits
+relative to the organizational trust line.** They compose into concrete
+*scenarios* (9.3.3), which is where the LINDDUN PRO elicitation is run.
 
-> **Why still document the shipped default?** It is the one configuration that is
-> unambiguously "what the software does out of the box" and is therefore the
-> reference/control case against which hardening and target deployments are
-> compared. It is a baseline, not necessarily the deployment that will be
-> analyzed for production risk.
+#### 9.3.1 Deployment (topology) impact per destination
 
-**Profiles used in this document:**
+Each external destination role can be placed at a different point on the
+topology axis. The placement, not the code, decides the boundary class and the
+privacy consequence. All placements below are supported by the configuration
+surface cited.
 
-| Profile | Description | Key config deltas vs default |
-|---|---|---|
-| **P0 — Default / demo** (shipped) | The configuration in `settings.yaml` as cloned. Reference/control case. | auth off; CORS open; local on-disk stores; `openai.api_base` = third party; observability off; schedulers local; broker memory |
-| **P1 — Hardened single-tenant** | One trusted operator, one tenant, locked down for a pilot or internal deployment. | auth **on** (shared secret); TLS terminated in front; `openai.api_base` → **co-located local vLLM** (same operator); observability off or local-only; CORS restricted |
-| **P2 — Target multi-tenant** | Multiple independent tenants/users served by one deployment, requiring data isolation between them. **Aspirational — not enforced by the current codebase (see 9.6).** | P1 + per-tenant/collection access control binding caller identity to data scope |
+| Destination | Placement options (config knob) | Boundary class by placement | Privacy consequence of the remote/SaaS choice |
+|---|---|---|---|
+| EE-INFERENCE (LLM) | co-located / same-operator network / third-party SaaS (`openai.api_base`, `settings.py` OpenAISettings) | internal process → network-internal → **organizational (third party)** | Prompts + full history + retrieved context leave the controller's premises to a model provider with its own logging/retention; processor relationship + DPA needed |
+| EE-EMBED (embeddings) | same as LLM (`openai.embedding_api_base` or `api_base`) | same as LLM | Chunk text (ingest) and query text (retrieval) leave to a third party |
+| EE-QDRANT (vector store) | embedded on-disk / in-memory / self-hosted / **Qdrant Cloud** (`qdrant.path` vs `qdrant.url`+`api_key`; `vectorstore.database` registry) | local data-at-rest (TB-LOCAL-STORE) → network-internal → **organizational (third party)** | Vectors + chunk/table text + metadata (incl. `file_name`) persisted off-premises; retention/erasure now a processor's responsibility |
+| EE-DOCLING (parse) | localhost sidecar / remote (`docling.api_base`, optional `api_key`/`tenant_id`) | process → network-internal → **organizational** | Raw, unredacted source files leave to a parsing provider |
+| EE-S3 (object storage) | local filesystem / in-cluster MinIO / **AWS S3** (`s3.endpoint_url`; `*.storage_provider`) | TB-LOCAL-STORE → network-internal → **organizational** | Uploaded/session files + skill bundles stored off-premises |
+| EE-BROKER (Redis/RabbitMQ) | in-process memory / co-located / managed cloud (`stream.broker`, `redis.host`, `rabbitmq.host`) | none → network-internal → **organizational** | Streamed chat events / task payloads (prompt/response content) transit a broker; managed cloud adds a processor |
+| EE-OTEL (trace sink) | local JSONL file / co-located collector / **vendor SaaS** (`observability.exporters[].type`/`options`) | TB-LOCAL-STORE → network-internal → **organizational** | When content capture is on, full prompts/completions/retrieved text leave to an observability vendor |
 
-Each boundary's summary row (9.5) and motivation (9.6) notes how it changes
-across P0/P1/P2. A boundary that exists only under a given profile is labelled
-accordingly; a boundary that is *required* by a profile but not implemented is
-labelled **aspirational**.
+Reading guide: moving a destination rightward (toward SaaS) upgrades its
+crossing from an internal or process boundary to an **organizational** one,
+which is where Disclosure, Non-compliance, and Unawareness threats concentrate
+in the LINDDUN PRO step. A fully self-hosted placement collapses several of
+these crossings back inside TB-LOCAL-STORE (admin-as-adversary) instead.
+
+#### 9.3.2 Configuration impact per setting
+
+Independently of topology, configuration toggles which flows exist and how the
+caller boundary is enforced.
+
+| Setting | Values | Flow / boundary governed | Privacy effect |
+|---|---|---|---|
+| `server.auth.enabled` | off (default) / on | TB-NET | Off: any caller reaches the API. On: server-level gate (shared secret). Neither creates TB-USER |
+| `server.cors.*` | open (default) / restricted | TB-NET | Open allows any browser origin to drive the API |
+| `vectorstore.multitenancy` | `logical` / `collection` | TB-USER (partitioning only) | Adds a collection filter/`group_id`; **not** access control — any caller may name any collection |
+| `web_search.enabled` + `provider` | off/`mock` (default) / `brave` | DF-07 → EE-BRAVE | Enabling egresses query text to Brave |
+| `web_fetch.enabled` | off (default) / on | DF-08 → EE-WEBSITE | Enabling allows model-driven fetching of arbitrary URLs |
+| `observability.mode` + `capture_content` + `capture_http_bodies` | none (default) / otel + true | DF-12 → EE-OTEL / TB-LOCAL-STORE | Enabling persists full prompts, completions, retrieved text, HTTP bodies |
+| `scheduler.ingestion.mode` | local (default) / celery | DS-S3-TEMP | Celery path stages raw document bytes in a temp bucket |
+| `code_execution.internet_enabled` | false (default) / true | TB-SANDBOX | Advisory only for the local provider (not enforced) |
+
+#### 9.3.3 Scenarios (points on both axes) used for elicitation
+
+The named scenarios below are **combinations** of a configuration posture and a
+topology choice. They are not the primary modelling unit — the two axes above
+are — but they make the later threat elicitation concrete. The shipped default
+is kept as the control case.
+
+| Scenario | Configuration posture | Topology posture | Notes |
+|---|---|---|---|
+| **S0 — Default / demo** (shipped) | auth off; CORS open; observability off; schedulers local | LLM/embed = third-party SaaS; Qdrant embedded; storage local; broker memory | Reference/control case — "out of the box" |
+| **S1 — Hardened, fully self-hosted** | auth on; TLS; CORS restricted; observability local-only | **all destinations co-located / same-operator** (local vLLM, self-hosted Qdrant, MinIO, local collector) | Minimizes organizational crossings; concentrates risk in TB-LOCAL-STORE |
+| **S1′ — Hardened, cloud-backed** | same config as S1 | LLM and/or Qdrant and/or object store = **managed cloud** | Same config hardening, but one or more destinations become organizational boundaries — isolates the *deployment* impact from the *config* impact |
+| **S2 — Target multi-tenant** | S1 + per-tenant access control | any | Requires TB-USER isolation — **aspirational, not enforced by current code (see 9.6)** |
+
+> **Why keep S0?** It is the one configuration/topology combination that is
+> unambiguously "what the software does out of the box" — the reference against
+> which hardening (S1) and cloud placement (S1′) are compared. Comparing S1 with
+> S1′ is precisely how this model answers "what is the privacy impact of using a
+> cloud service for X?": the config is held constant and only the topology moves.
+
+The boundary summary (9.5) and motivation (9.6) annotate each boundary with how
+it behaves across these scenarios. For brevity the summary table uses the short
+labels S0 / S1 / S2 (S1′ is called out only where topology changes the boundary
+class). A boundary required by a scenario but not implemented is labelled
+**aspirational**.
 
 ### 9.4 Boundary diagram
 
@@ -783,9 +837,9 @@ enforced by current code.
 flowchart TB
     CLIENT([EE-CLIENT])
 
-    subgraph TBNET["TB-NET — client/API boundary (P0: auth OFF, CORS open; P1/P2: auth+TLS)"]
+    subgraph TBNET["TB-NET — client/API boundary (S0: auth OFF, CORS open; S1+: auth+TLS)"]
         direction TB
-        subgraph TBUSER["TB-USER — inter-user / tenant isolation (P2, ASPIRATIONAL — not enforced)"]
+        subgraph TBUSER["TB-USER — inter-user / tenant isolation (S2, ASPIRATIONAL — not enforced)"]
             CORE["PrivateGPT orchestration"]
             subgraph TBLOCAL["TB-LOCAL-STORE — local data-at-rest (admin-as-adversary)"]
                 QD[("on-disk Qdrant / index JSON")]
@@ -798,7 +852,7 @@ flowchart TB
         end
     end
 
-    subgraph TBINFER["TB-INFER — model services (P0: third party; P1/P2: co-located)"]
+    subgraph TBINFER["TB-INFER — model services (cloud = third party; co-located = internal)"]
         INFER([EE-INFERENCE])
         EMBED([EE-EMBED])
     end
@@ -835,21 +889,21 @@ flowchart TB
 
 ### 9.5 Boundary summary
 
-The **Profile** column shows where the boundary is an *organizational / trust*
-crossing: `P0` default, `P1` hardened single-tenant, `P2` target multi-tenant.
-"all" = present in every profile; "aspirational" = required by the profile but
-**not enforced by the current code**.
+The **Scenario** column shows how the boundary behaves across the scenarios of
+9.3.3: `S0` default, `S1` hardened self-hosted, `S1′` hardened cloud-backed, `S2`
+target multi-tenant. "all" = present in every scenario; "aspirational" = required
+by the scenario but **not enforced by the current code**.
 
-| Boundary | Type | Crossing(s) | Profile | Notes |
+| Boundary | Type | Crossing(s) | Scenario | Notes |
 |---|---|---|---|---|
-| TB-NET | Physical / network | EE-CLIENT → P-API | all (posture varies) | **P0:** open — auth disabled, CORS open, plaintext `0.0.0.0:8080`. **P1/P2:** authenticated (shared secret) + TLS. Server-level only — see TB-USER |
-| TB-USER | Logical (intra-system) | caller A's data ↔ caller B's data inside P-API/stores | **P2 (aspirational)** | No code binds caller identity to a data scope. `collection` is a request-supplied **filter**, not access control (`components/vector_store/vector_store_component.py:101-105`); `Principal` is never used to authorize collection/tenant access. Enabling auth does **not** create this boundary (one shared secret, one zone) |
-| TB-INFER | Physical / network | P-LLM → EE-INFERENCE; P-EMBED → EE-EMBED | **P0:** organizational (third-party provider). **P1/P2:** co-located local model → process/network boundary only, not organizational | Operator (settings) credentials; caller Principal credentials not forwarded; carries conversational text (incl. verbatim user prompts), retrieved chunks, and vectors |
-| TB-PARSE | Physical / network | P-INGEST → EE-DOCLING | **P0:** localhost sidecar (process boundary); organizational if `api_base` is remote. **P1/P2:** co-located | Raw, unredacted source document bytes (base64) |
-| TB-TOOLS | Physical / network | P-WEBSEARCH → EE-BRAVE; P-WEBFETCH → EE-WEBSITE; P-MCP → EE-MCP; P-DBQUERY → EE-EXTDB | all when enabled (off in P0 defaults) | MCP + external DB endpoints and credentials are caller-supplied per request; several flows return data into the prompt |
+| TB-NET | Physical / network | EE-CLIENT → P-API | all (posture varies) | **S0:** open — auth disabled, CORS open, plaintext `0.0.0.0:8080`. **S1+:** authenticated (shared secret) + TLS. Server-level only — see TB-USER |
+| TB-USER | Logical (intra-system) | caller A's data ↔ caller B's data inside P-API/stores | **S2 (aspirational)** | No code binds caller identity to a data scope. `collection` is a request-supplied **filter**, not access control (`components/vector_store/vector_store_component.py:101-105`); `Principal` is never used to authorize collection/tenant access. Enabling auth does **not** create this boundary (one shared secret, one zone) |
+| TB-INFER | Physical / network | P-LLM → EE-INFERENCE; P-EMBED → EE-EMBED | **topology-dependent:** cloud (S0/S1′) → organizational; co-located (S1) → process/network only | Operator (settings) credentials; caller Principal credentials not forwarded; carries conversational text (incl. verbatim user prompts), retrieved chunks, and vectors |
+| TB-PARSE | Physical / network | P-INGEST → EE-DOCLING | **topology-dependent:** localhost sidecar → process boundary; remote `api_base` → organizational | Raw, unredacted source document bytes (base64) |
+| TB-TOOLS | Physical / network | P-WEBSEARCH → EE-BRAVE; P-WEBFETCH → EE-WEBSITE; P-MCP → EE-MCP; P-DBQUERY → EE-EXTDB | all when enabled (off in S0 defaults) | MCP + external DB endpoints and credentials are caller-supplied per request; several flows return data into the prompt |
 | TB-SANDBOX | Logical / process | P-CODEEXEC → host subprocess | all | rlimit isolation; no network isolation; `internet_enabled` advisory only for local provider |
-| TB-LOCAL-STORE | Logical (data-at-rest) | P-* → on-disk Qdrant, index JSON, uploaded/session files, `traces.jsonl`, logs | **P0/P1** (default persistence) | Data at rest *inside* the core under shipped defaults. Operator/admin has full read access; concerns are retention, deletion, and **admin-as-adversary** rather than network egress. Becomes TB-STORAGE when externalized |
-| TB-STORAGE | Physical / network | P-FILES → EE-S3; P-SCHED → EE-BROKER; P-OBS → EE-OTEL | config-gated (off in P0 defaults) | Externalized persistence; organizational crossing if the storage/broker/trace backend is a different party |
+| TB-LOCAL-STORE | Logical (data-at-rest) | P-* → on-disk Qdrant, index JSON, uploaded/session files, `traces.jsonl`, logs | **S0/S1** (local persistence) | Data at rest *inside* the core under shipped defaults. Operator/admin has full read access; concerns are retention, deletion, and **admin-as-adversary** rather than network egress. Becomes TB-STORAGE when externalized |
+| TB-STORAGE | Physical / network | P-FILES → EE-S3; P-SCHED → EE-BROKER; P-OBS → EE-OTEL | config-gated (off in S0 defaults) | Externalized persistence; organizational crossing if the storage/broker/trace backend is a different party |
 
 ### 9.6 Motivation for each boundary
 
@@ -892,12 +946,12 @@ Three postures result, and only the third provides inter-user separation:
 
 | Posture | TB-NET (caller→API) | TB-USER (A vs B) |
 |---|---|---|
-| Auth off (P0 default) | none | none |
-| Auth on, shared secret (P1) | present (server-level) | **still none** |
-| Per-tenant isolation (P2) | present | present — **not implemented** |
+| Auth off (S0 default) | none | none |
+| Auth on, shared secret (S1) | present (server-level) | **still none** |
+| Per-tenant isolation (S2) | present | present — **not implemented** |
 
 TB-USER is therefore drawn as an **aspirational** boundary: it is the boundary a
-multi-tenant deployment (P2) *requires*, but which no code path currently
+multi-tenant deployment (S2) *requires*, but which no code path currently
 enforces. Recording it explicitly is itself a finding (it maps to Linking,
 Identifying, and Data-Disclosure threats between data subjects), and it is
 exactly where a **collection-isolation test** belongs — such a test would assert
@@ -1026,7 +1080,7 @@ mechanism, controlling party (model-authored code), direction (can read local
 files and session data).
 
 **TB-LOCAL-STORE — default data-at-rest inside the core (admin-as-adversary).**
-Under the shipped defaults (P0) and a hardened single-tenant deployment (P1),
+Under the shipped defaults (S0) and a hardened self-hosted deployment (S1),
 persistence is *local*: the on-disk Qdrant store (`local_data/qdrant/`), index
 JSON, uploaded and session files, application logs, and — when observability is
 on — `local_data/traces/traces.jsonl`. These do not cross a network, so they are
@@ -1070,18 +1124,18 @@ Each flow records the LINDDUN PRO privacy attributes requested. "Possible person
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | DF-01 | EE-CLIENT → P-CHAT | prompts, message history, system prompt, tool defs, MCP configs, attachments (base64 docs/images) | Yes | Generate chat completion | HTTP(S) | Authorization header; **auth disabled by default** | TB-NET | Redis stream (TTL 3600s) if broker=redis, else in-memory | No | default-on | `server/chat/chat_router.py:20`; `launcher.py:94-101` |
 | DF-02 | P-LLM → EE-INFERENCE | system prompt, full message history, retrieved RAG context, tool defs, sampling params | Yes | LLM generation | HTTP(S) via AsyncOpenAI SDK | Static `openai.api_key`; caller creds not forwarded | TB-INFER | — | Yes | default-on | `components/engines/chat/async_chat_engine.py:1127`; `components/custom/openai.py:62` |
-| DF-03 | P-RETRIEVE → EE-EMBED, DS-QDRANT | query text, query vector | Yes | Retrieval | HTTP(S) to embed; local/grpc/http to Qdrant | Static creds | TB-INFER (+TB-STORAGE if remote Qdrant) | Vector in Qdrant | Embed server yes; Qdrant local by default | default-on | `components/workflows/retrieval/retrieval.py:144`; `components/tools/builders/semantic_search_builder.py:218` |
-| DF-04 | EE-CLIENT → P-INGEST | raw file bytes (base64) / URI / text, metadata (file_name, author, dept, year, project_id, org_id) | Yes | Ingest for RAG | HTTP(S) | Auth dep | TB-NET | Chunk text+metadata → Qdrant; index → JSON; raw bytes transient (or temp S3 in celery mode) | No | default-on | `server/ingest/ingest_router.py`; `components/ingest/metadata_helper.py:7-21` |
+| DF-03 | P-RETRIEVE → EE-EMBED, DS-QDRANT | query text, query vector | Yes | Retrieval | HTTP(S) to embed; local/grpc/http to Qdrant | Static creds | TB-INFER; Qdrant at rest = TB-LOCAL-STORE (embedded) or TB-STORAGE (remote) | Vector in Qdrant | Embed server yes; Qdrant local by default | default-on | `components/workflows/retrieval/retrieval.py:144`; `components/tools/builders/semantic_search_builder.py:218` |
+| DF-04 | EE-CLIENT → P-INGEST | raw file bytes (base64) / URI / text, metadata (file_name, author, dept, year, project_id, org_id) | Yes | Ingest for RAG | HTTP(S) | Auth dep | TB-NET; persists to TB-LOCAL-STORE | Chunk text+metadata → Qdrant; index → JSON; raw bytes transient (or temp S3 in celery mode) | No | default-on | `server/ingest/ingest_router.py`; `components/ingest/metadata_helper.py:7-21` |
 | DF-05 | P-INGEST → EE-DOCLING | raw document bytes (base64) | Yes | Document parsing | HTTP POST (+ optional X-Api-Key / X-Tenant-Id) | Optional API key | TB-PARSE | — | Localhost sidecar by default; configurable to any host | config-gated | `components/readers/docling/api_clients.py:313-343` |
 | DF-06 | P-INGEST → EE-EMBED | chunk text | Yes | Embedding | HTTP(S) | Static creds | TB-INFER | Vector in Qdrant | Yes | default-on | `components/embedding/factories/openailike.py:27`; `artifact_index/base_artifact_index.py:520-528` |
 | DF-07 | P-WEBSEARCH → EE-BRAVE | search query text (LLM/user-driven) | Yes | Web search | HTTPS GET, `X-Subscription-Token` (`brave.api_key`) | Settings secret | TB-TOOLS | Optional cache | Yes | config-gated (default off) | `components/web/web_search/providers/brave.py:18-19,44,240-269` |
 | DF-08 | P-WEBFETCH → EE-WEBSITE | model-supplied URL, rendered page HTML | Possible (URL may encode personal data) | Web fetch | HTTP(S) via headless Chromium | None (optional proxy creds) | TB-TOOLS | — | Yes | config-gated (default off) | `components/web/scraper/scrape_script.py:72-98` |
 | DF-09 | P-MCP → EE-MCP | tool arguments (LLM-generated, may embed chat content) | Yes | External tool call | streamable-HTTP / SSE / stdio | Request-supplied Bearer / OAuth | TB-TOOLS | — | Yes | config-gated (request-driven) | `server/mcp/mcp_service.py:290-311`; `server/mcp/_runtime.py:218-252` |
 | DF-10 | P-DBQUERY ↔ EE-EXTDB | out: generated SQL; in: DB rows (possible personal data) → sampled into LLM prompt | Yes | Structured data query | SQLAlchemy driver (pg/mysql/mssql/db2); SSL TODO/unverified | Request-supplied connection string | TB-TOOLS (+TB-INFER for schema+results to LLM) | CSV to session outputs | Yes | config-gated (request-driven) | `components/tabular/database_query_generator.py:529,947-988` |
-| DF-11 | P-CODEEXEC → DS-FILES-LOCAL / host subprocess | LLM-generated code, workspace files, command output | Yes | Code execution | local subprocess | rlimits; Principal env not injected (local provider) | TB-SANDBOX | Workspace/output files | No (no net isolation, but no deliberate egress) | default-on | `components/code_execution/bash_executor.py:87-106` |
-| DF-12 | P-OBS → DS-TRACES / EE-OTEL | prompts, completions, tool args/results, retrieved text, parsed-doc preview, HTTP bodies | Yes | Observability | file append / OTLP | — | TB-STORAGE | JSONL file (rotated) | If OTLP configured | config-gated (mode=none default) | `observability/exporters.py:63-120`; `observability/http.py:139-190` |
+| DF-11 | P-CODEEXEC → DS-FILES-LOCAL / host subprocess | LLM-generated code, workspace files, command output | Yes | Code execution | local subprocess | rlimits; Principal env not injected (local provider) | TB-SANDBOX; outputs at rest = TB-LOCAL-STORE | Workspace/output files | No (no net isolation, but no deliberate egress) | default-on | `components/code_execution/bash_executor.py:87-106` |
+| DF-12 | P-OBS → DS-TRACES / EE-OTEL | prompts, completions, tool args/results, retrieved text, parsed-doc preview, HTTP bodies | Yes | Observability | file append / OTLP | — | TB-LOCAL-STORE (JSONL file, default) or TB-STORAGE (remote collector) | JSONL file (rotated) | If OTLP configured | config-gated (mode=none default) | `observability/exporters.py:63-120`; `observability/http.py:139-190` |
 | DF-13 | P-CONTENT → EE-CLIENT | full or chunked document content | Yes | Content retrieval | HTTP(S) | Auth dep | TB-NET | — | No | default-on | `server/content/content_router.py` |
-| DF-14 | EE-CLIENT → P-FILES → DS-FILES-LOCAL / DS-S3-DURABLE | arbitrary file bytes, filename | Yes | Session file storage | HTTP(S) | Auth dep | TB-NET, TB-STORAGE | Local FS or S3 | If S3 configured | default-on (local) | `server/files/files_router.py`; `server/files/file_service.py:70-91` |
+| DF-14 | EE-CLIENT → P-FILES → DS-FILES-LOCAL / DS-S3-DURABLE | arbitrary file bytes, filename | Yes | Session file storage | HTTP(S) | Auth dep | TB-NET; at rest = TB-LOCAL-STORE (local) or TB-STORAGE (S3) | Local FS or S3 | If S3 configured | default-on (local) | `server/files/files_router.py`; `server/files/file_service.py:70-91` |
 | DF-15 | EE-CLIENT → P-EMBED → EE-EMBED | input text, vectors | Yes | Embeddings API | HTTP(S) | Auth dep | TB-NET, TB-INFER | — | Yes | default-on | `server/embeddings/embeddings_router.py` |
 
 ---
@@ -1089,6 +1143,8 @@ Each flow records the LINDDUN PRO privacy attributes requested. "Possible person
 ## 11. Data-at-rest and retention
 
 ### 11.1 Stores that may hold personal/sensitive content (under shipped defaults)
+
+These local stores are the concrete contents of **TB-LOCAL-STORE** (section 9.5); under a cloud topology (9.3.1) they migrate to TB-STORAGE.
 
 | Store | Location | Contents | Retention | Deletion path |
 |---|---|---|---|---|
@@ -1156,7 +1212,14 @@ Each flow records the LINDDUN PRO privacy attributes requested. "Possible person
 | DS-REDIS-STREAM | Store | `components/streaming/stream/registry.py:26-33` | config-gated (memory default) |
 | DS-CHECKPOINT | Store | `arq/chat/iteration_state.py`; `components/.../checkpoint_store.py:171` | config-gated (in-mem default) |
 | DS-LOGS (query at INFO) | Store | `components/workflows/retrieval/semantic_search.py:186`; `components/llm/prompt_styles/prompt_style_base.py:126,132` (DEBUG) | default-on |
-| TB-NET / CORS open / auth off | Boundary | `settings.yaml` `server.cors`, `server.auth` | default posture |
+| TB-NET / CORS open / auth off | Boundary | `settings.yaml` `server.cors`, `server.auth`; `server/utils/auth.py` | default posture |
+| TB-USER (inter-user/tenant isolation) | Boundary | `components/vector_store/vector_store_component.py:101-105`; `server/principal.py`; `server/utils/auth.py` | aspirational (not enforced) |
+| TB-INFER (model services) | Boundary | `components/custom/openai.py:62`; `components/embedding/factories/openailike.py:27` | topology-dependent |
+| TB-PARSE (parse egress) | Boundary | `components/readers/docling/api_clients.py:313-343` | topology-dependent |
+| TB-TOOLS (tool third parties) | Boundary | `server/mcp/mcp_service.py:290-311`; `server/utils/artifact_input.py:168-215` | config/request-gated |
+| TB-SANDBOX (code-exec subprocess) | Boundary | `components/code_execution/bash_executor.py:87-106` | default-on |
+| TB-LOCAL-STORE (local data-at-rest) | Boundary | `local_data/qdrant` (`qdrant_client_builder.py:76-96`); `server/files/file_service.py:70-91`; `observability/exporters.py:63-120` | S0/S1 default persistence |
+| TB-STORAGE (externalized persistence) | Boundary | `components/storage/object_storage.py:180`; `components/streaming/stream/registry.py:26-33` | config-gated |
 
 ---
 
