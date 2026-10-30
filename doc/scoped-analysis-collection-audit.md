@@ -15,7 +15,7 @@
 3. [Relevant use cases](#3-relevant-use-cases)
 4. [Cross-collection retrieval: grounding in source code](#4-cross-collection-retrieval-grounding-in-source-code)
 5. [Audit telemetry is not an existing feature](#5-audit-telemetry-is-not-an-existing-feature)
-6. [Two ways to realise audit telemetry](#6-two-ways-to-realise-audit-telemetry)
+6. [How audit telemetry can be added, and its effect on trust boundaries](#6-how-audit-telemetry-can-be-added-and-its-effect-on-trust-boundaries)
 7. [Model extension: audit telemetry DFD elements](#7-model-extension-audit-telemetry-dfd-elements)
 8. [Privacy/security trade-off and the LINDDUN view](#8-privacysecurity-trade-off-and-the-linddun-view)
 9. [Scoped target model (what the LINDDUN pass will cover)](#9-scoped-target-model-what-the-linddun-pass-will-cover)
@@ -240,11 +240,40 @@ lacks.
 
 ---
 
-## 6. Two ways to realise audit telemetry
+## 6. How audit telemetry can be added, and its effect on trust boundaries
 
-The task note correctly identifies two architectural options. They differ in
-*where the audit data lives and who controls it*, which is exactly what changes
-the trust boundaries and therefore the LINDDUN picture.
+Because audit telemetry does not exist today (§5), it has to be *added*, and the
+way it is added determines which trust boundaries the audit data crosses. At a
+mechanical level, PrivateGPT already exposes three insertion points where an
+audit record could be produced without changing the retrieval logic:
+
+- **In-process hook at `P-RETRIEVE` / `P-CHAT`** — the point where the
+  `collection` selector and the query are already in hand (the same place the
+  existing INFO query log is emitted,
+  `components/workflows/retrieval/semantic_search.py:186`).
+- **The observability pipeline** — `P-OBS` already folds query and retrieved
+  text into spans and exports them (`observability/exporters.py:63-120`); an
+  audit consumer could subscribe to an exporter rather than the code being
+  changed.
+- **The streaming/event mechanism** — retrieval activity already flows through
+  the stream broker when `stream.broker=redis`
+  (`components/streaming/stream/registry.py:26-33`), which an external consumer
+  could tap.
+
+Whichever insertion point is used, the privacy-relevant design decision is
+**where the resulting audit data lives and who controls it**, because that is
+what sets the trust boundary the audit data crosses. At least two architectural
+options exist, and they sit at opposite ends of that decision:
+
+- **Option A** keeps the audit data *inside* PrivateGPT's own trust zone
+  (`TB-LOCAL-STORE`) — no new network crossing, same operator.
+- **Option B** moves it *out* to a separate consumer across a **new boundary
+  (`TB-AUDIT`)** — a distinct component, team, or operator.
+
+Other hybrids are possible (e.g. emit internally but forward a minimised subset
+externally); the two options below bound the design space and are sufficient to
+expose the LINDDUN trade-off. The resulting boundary changes are modelled in §7
+and compared in §8.3.
 
 ### Option A — Extend PrivateGPT (audit as an internal feature)
 
