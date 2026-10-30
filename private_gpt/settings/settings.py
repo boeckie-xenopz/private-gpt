@@ -928,6 +928,17 @@ class VectorstoreSettings(BaseModel):
         None,
         description="The default collection to use for the vector store.",
     )
+    strict_isolation: bool = Field(
+        default=False,
+        description=(
+            "Fail-closed collection isolation (privacy mitigation P1.1/P1.2). "
+            "When True: a tenancy filter is applied for the requested collection "
+            "in every multitenancy mode (defence in depth), a missing/empty "
+            "collection is refused instead of running unscoped, and retrieval is "
+            "gated by the bound CollectionAuthorizer. Default False preserves "
+            "single-tenant (S0/S1) behaviour; enable for multi-tenant (S2)."
+        ),
+    )
 
 
 class NodeStoreSettings(BaseModel):

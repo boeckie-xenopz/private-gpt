@@ -14,13 +14,18 @@ The isolation boundary is realised entirely by
 ``VectorStoreComponent.get_filters`` (see
 ``private_gpt/components/vector_store/vector_store_component.py``). These tests
 assert the *privacy property* ("a query scoped to collection B must not be able
-to match collection A") directly on that function, and document the current
-behaviour where the property does NOT hold.
+to match collection A") directly on that function.
 
-Tests whose name ends in ``_documents_gap`` encode a *known gap* from the threat
-model: they assert the current (insecure) behaviour and are marked ``xfail`` with
-``strict=False`` so that, if the code is later hardened to fail-closed, the test
-turns XPASS and flags that the model/tests should be updated.
+The file has three groups:
+
+* ``*_current_behaviour`` — pin the historical (non-strict) behaviour, which is
+  still the default when ``vectorstore.strict_isolation`` is off (scenarios
+  S0/S1). These stay green.
+* ``*_strict_*`` — assert the fail-closed mitigations P1.1/P1.2 when
+  ``strict_isolation`` is enabled (scenario S2): defence-in-depth tenancy
+  filtering in every mode, refusal of an empty collection, and authorisation of
+  the requested collection.
+* authorizer tests — the collection authorisation hook (P1.1).
 """
 
 import pytest
@@ -31,6 +36,9 @@ from llama_index.core.vector_stores.types import (
 )
 
 from private_gpt.components.ingest.metadata_helper import MetadataKeys
+from private_gpt.components.vector_store.collection_isolation import (
+    CollectionIsolationError,
+)
 from private_gpt.components.vector_store.vector_store_component import (
     VectorStoreComponent,
 )
@@ -56,9 +64,20 @@ def _collection_filter_values(filters: MetadataFilters) -> list[object]:
     return [f.value for f in _flatten(filters) if f.key == COLLECTION_KEY]
 
 
-def _component(injector: MockInjector, *, multitenancy: str) -> VectorStoreComponent:
+def _component(
+    injector: MockInjector,
+    *,
+    multitenancy: str,
+    strict: bool = False,
+) -> VectorStoreComponent:
     injector.bind_settings(
-        {"vectorstore": {"multitenancy": multitenancy, "database": "qdrant"}}
+        {
+            "vectorstore": {
+                "multitenancy": multitenancy,
+                "database": "qdrant",
+                "strict_isolation": strict,
+            }
+        }
     )
     return injector.get(VectorStoreComponent)
 
@@ -175,27 +194,19 @@ def test_empty_collection_no_tenancy_filter_current_behaviour(
     assert _collection_filter_values(filters) == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="T-DF03-Dd1: empty collection fails OPEN. Privacy-correct behaviour is "
-    "to fail closed (no unscoped retrieval). XPASS = the gap was fixed; update "
-    "this test and the threat model.",
-)
-def test_empty_collection_should_fail_closed_desired(
+def test_empty_collection_fails_closed_under_strict(
     injector: MockInjector,
 ) -> None:
-    """DESIRED behaviour: an empty/missing collection must not retrieve unscoped.
+    """MITIGATION P1.2: strict isolation refuses an empty/missing collection.
 
-    Expressed as: the resulting filter must still constrain the collection key
-    (or retrieval must be refused upstream). Fails today by design.
+    Instead of returning an unscoped filter (the historical gap, T-DF03-Dd1),
+    ``get_filters`` now raises ``CollectionIsolationError`` so no unscoped
+    retrieval can happen. The API layer maps this to a client error.
     """
-    component = _component(injector, multitenancy="logical")
+    component = _component(injector, multitenancy="logical", strict=True)
 
-    filters = component.get_filters(collection="")
-
-    assert _collection_filter_values(filters), (
-        "a missing collection must not yield an unscoped query"
-    )
+    with pytest.raises(CollectionIsolationError):
+        component.get_filters(collection="")
 
 
 def test_physical_multitenancy_no_logical_filter_current_behaviour(
@@ -215,21 +226,70 @@ def test_physical_multitenancy_no_logical_filter_current_behaviour(
     assert _collection_filter_values(filters) == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="T-DF03-Dd1: physical multitenancy adds no in-query tenancy filter "
-    "(defence-in-depth). XPASS = such a filter was added; update this test.",
-)
-def test_physical_multitenancy_should_add_defence_in_depth_filter_desired(
+def test_physical_multitenancy_adds_defence_in_depth_filter_under_strict(
     injector: MockInjector,
 ) -> None:
-    """DESIRED behaviour: a defence-in-depth tenancy filter even in physical mode.
+    """MITIGATION P1.2: strict isolation adds a tenancy filter even in physical mode.
 
-    Fails today by design; documents that physical isolation is currently the
-    only line of defence.
+    Historically (T-DF03-Dd1) physical ``collection`` multitenancy added no
+    in-query tenancy filter, relying solely on physical routing. Under strict
+    isolation the collection constraint is applied as defence in depth.
     """
-    component = _component(injector, multitenancy="collection")
+    component = _component(injector, multitenancy="collection", strict=True)
 
     filters = component.get_filters(collection="collection_b")
 
     assert "collection_b" in _collection_filter_values(filters)
+
+
+# ---------------------------------------------------------------------------
+# P1.1 — collection authorisation hook (fixes T-DF03-Dd2 / T-DF01-Nc1).
+# ---------------------------------------------------------------------------
+
+
+class _AllowListAuthorizer:
+    """Test authorizer: only the collections in the allow-list are permitted."""
+
+    def __init__(self, allowed: set[str]) -> None:
+        self._allowed = allowed
+
+    def is_authorized(self, collection: str) -> bool:
+        return collection in self._allowed
+
+
+def test_non_strict_mode_does_not_enforce_authorisation(
+    injector: MockInjector,
+) -> None:
+    """Default (non-strict) mode is unchanged: no authorisation is enforced.
+
+    Preserves S0/S1 single-tenant behaviour — the authorizer is not consulted.
+    """
+    component = _component(injector, multitenancy="logical", strict=False)
+    component._authorizer = _AllowListAuthorizer(set())  # authorises nothing
+
+    # Must NOT raise, because strict isolation is off.
+    filters = component.get_filters(collection="any_collection")
+    assert _collection_filter_values(filters) == ["any_collection"]
+
+
+def test_strict_mode_allows_authorised_collection(injector: MockInjector) -> None:
+    """MITIGATION P1.1: an authorised collection is permitted and scoped."""
+    component = _component(injector, multitenancy="logical", strict=True)
+    component._authorizer = _AllowListAuthorizer({"collection_b"})
+
+    filters = component.get_filters(collection="collection_b")
+    assert _collection_filter_values(filters) == ["collection_b"]
+
+
+def test_strict_mode_denies_unauthorised_collection(injector: MockInjector) -> None:
+    """MITIGATION P1.1: naming another tenant's collection is refused (T-DF03-Dd2).
+
+    The request-supplied collection is no longer trusted blindly; the authorizer
+    denies access and ``get_filters`` raises instead of building a filter that
+    would read someone else's collection.
+    """
+    component = _component(injector, multitenancy="logical", strict=True)
+    component._authorizer = _AllowListAuthorizer({"my_collection"})
+
+    with pytest.raises(CollectionIsolationError):
+        component.get_filters(collection="someone_elses_collection")

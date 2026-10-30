@@ -13,6 +13,11 @@ from llama_index.core.vector_stores.types import (
 
 from private_gpt.components.embedding.embedding_component import EmbeddingComponent
 from private_gpt.components.ingest.metadata_helper import MetadataKeys
+from private_gpt.components.vector_store.collection_isolation import (
+    AllowAllCollectionAuthorizer,
+    CollectionAuthorizer,
+    ensure_collection_access,
+)
 from private_gpt.components.vector_store.factory import (
     _PROVIDERS,
     VectorStoreFactory,
@@ -74,6 +79,25 @@ class VectorStoreComponent:
     def default_collection(self) -> str:
         return self._settings.vectorstore.default_collection or DEFAULT_COLLECTION
 
+    @property
+    def strict_isolation(self) -> bool:
+        return self._settings.vectorstore.strict_isolation
+
+    @property
+    def authorizer(self) -> CollectionAuthorizer:
+        """Collection authorizer consulted before retrieval (P1.1).
+
+        Defaults to allow-all so single-tenant deployments are unchanged. A
+        multi-tenant deployment overrides this binding (or sets one via DI) with
+        an implementation that maps the current Principal to entitled
+        collections.
+        """
+        authorizer = getattr(self, "_authorizer", None)
+        if authorizer is None:
+            authorizer = AllowAllCollectionAuthorizer()
+            self._authorizer = authorizer
+        return authorizer
+
     def vector_store(self, collection: str) -> BasePydanticVectorStore:
         return self._factory.vector_store(collection)
 
@@ -98,7 +122,21 @@ class VectorStoreComponent:
                     MetadataFilter(key=MetadataKeys.ARTIFACT_ID.value, value=artifact)
                 )
 
-        if self.logical_multitenancy and collection:
+        # P1.1/P1.2: fail closed before building the query. When strict isolation
+        # is enabled, a missing/empty collection or an unauthorised collection is
+        # refused rather than producing an unscoped (leaky) search.
+        ensure_collection_access(
+            self.authorizer, collection, strict=self.strict_isolation
+        )
+
+        # Apply the tenancy filter whenever a collection is given. Historically
+        # this was gated on logical multitenancy only; under strict isolation it
+        # is applied in every mode as defence in depth (the collection metadata
+        # is present on every node regardless of physical/logical routing).
+        apply_tenancy_filter = bool(collection) and (
+            self.logical_multitenancy or self.strict_isolation
+        )
+        if apply_tenancy_filter:
             tenancy_filter = MetadataFilter(
                 key=MetadataKeys.COLLECTION.value, value=collection
             )
