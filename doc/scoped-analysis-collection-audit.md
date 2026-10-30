@@ -226,9 +226,27 @@ today is:
   it cannot by itself support cross-session attribution of a prober.
 - **Content-capturing traces (off by default).** The observability pipeline,
   when `observability.mode=otel`, persists full prompts, queries, and retrieved
-  text to `DS-TRACES` (`observability/exporters.py:63-120`). This is telemetry
-  for debugging, not an audit trail: it is not attributed per data subject by
-  design, its purpose is diagnostics, and it is off by default.
+  text to `DS-TRACES` (`observability/exporters.py:63-120`).
+
+**OpenTelemetry tracing is not auditing — the difference is purpose, not just
+default state.** The module describes itself as *"vendor-neutral tracing"*
+(`observability/__init__.py`); it is distributed-tracing instrumentation for
+*diagnostics and performance*, and the fact that it can record a query and the
+retrieved documents (`observability/tracing.py:retrieval_documents`) is
+incidental debug context, not an access record. It differs from audit telemetry
+on exactly the axes LINDDUN cares about:
+
+| Property | OpenTelemetry tracing (`P-OBS` → `DS-TRACES`) | Audit telemetry (`DS-AUDIT`, §7) |
+|---|---|---|
+| Purpose | Diagnostics / performance | Security accountability (detect probing) |
+| Subject of the data | The request/span (latency, errors, span tree) | The **querying user** (identity + behaviour) |
+| Attribution | Not attributed to a data subject by design | Attribution is the whole point |
+| Cross-session correlation | Not a goal (history even capped per span) | The goal |
+| Default | Off (`observability.mode: none`) | A control one would want on |
+| Retention | Size-rotated debug file (50MB×5) | Policy-driven audit retention |
+
+So tracing is the *nearest existing analogue* to audit telemetry and a possible
+insertion point (§6), but it is **not** audit telemetry.
 
 **Consequence for the model.** Issue 2 cannot be analysed against existing
 features alone, because the capability that creates the privacy risk — an
@@ -254,7 +272,11 @@ audit record could be produced without changing the retrieval logic:
 - **The observability pipeline** — `P-OBS` already folds query and retrieved
   text into spans and exports them (`observability/exporters.py:63-120`); an
   audit consumer could subscribe to an exporter rather than the code being
-  changed.
+  changed. **Caveat:** this pipeline is *diagnostics* tracing, not auditing
+  (§5). Reusing it as the audit mechanism changes its purpose without changing
+  its code, which is itself a purpose-limitation / Unawareness hazard (§8.3) —
+  data collected under a "debugging" notice would be repurposed for security
+  surveillance of users.
 - **The streaming/event mechanism** — retrieval activity already flows through
   the stream broker when `stream.broker=redis`
   (`components/streaming/stream/registry.py:26-33`), which an external consumer
@@ -409,6 +431,35 @@ categories bite hardest — **Option B is often preferable**, provided the expor
 is minimised (references/hashes, not raw queries) and TB-AUDIT is a controlled
 boundary. The decision is itself a LINDDUN-relevant design choice and should be
 recorded as such, not made implicitly.
+
+### 8.4 Special case: repurposing the OpenTelemetry pipeline as the audit trail
+
+A tempting shortcut is to treat the existing OpenTelemetry tracing (§5) as the
+audit mechanism — turn on `observability.mode=otel`, enable content capture, and
+point an exporter at a retained store. It is cheap because no retrieval code
+changes. From a LINDDUN view it is the **worst** of the options unless
+deliberately re-governed, because it *silently changes the purpose of an
+existing collection*:
+
+- **Non-compliance (purpose limitation).** The pipeline is instrumented and
+  documented as *diagnostics* tracing (`observability/__init__.py`). Reusing its
+  output for security surveillance of users is secondary-use of data collected
+  under a different purpose — the classic purpose-limitation violation.
+- **Unawareness / Transparency.** Any privacy notice covering "debugging traces"
+  does not cover "we profile your query behaviour for security"; data subjects
+  are unaware of the real processing.
+- **Minimisation.** Traces capture *full* prompts, queries, and retrieved text
+  (content, not references), so an audit built on them is maximally rich — the
+  opposite of the minimised, reference-only audit record Option B can enforce.
+- **Detecting / scope.** Trace content capture is global
+  (`capture_http_paths`, `capture_content`), so repurposing it collects far more
+  than the collection/query metadata the probing-detection purpose needs.
+
+If the OTel pipeline is used at all, it should feed a **purpose-built, minimised
+audit path** (hash/tokenise queries, keep collection + attribution + anomaly
+flag, drop content), governed and disclosed as auditing — effectively turning it
+back into Option A or B with an explicit purpose, not a silent reuse of
+diagnostics data.
 
 ---
 
