@@ -248,6 +248,34 @@ on exactly the axes LINDDUN cares about:
 So tracing is the *nearest existing analogue* to audit telemetry and a possible
 insertion point (§6), but it is **not** audit telemetry.
 
+**Standard logging carries the same two concerns as tracing — but is on by
+default and is a worse audit substitute.** Unlike observability (off by
+default), application logging runs at `INFO` out of the box (`debug_mode: false`
+→ `logging.INFO`, e.g. `di.py:27-30`). On the scoped RAG path the default
+`condense_strategy: condenser` (`settings.yaml`) means the condense branch runs
+on multi-turn queries, and it logs the **full user query text at INFO**:
+`logger.info(f"Condensing query: {ev.query}")`
+(`components/workflows/retrieval/semantic_search.py:186`). Reader modules also
+log `file_name` at INFO (e.g. `readers/pptx2md/pptx2md_reader.py:293`). More
+query/prompt content is logged at `DEBUG` only (`retrieval.py:143,254`,
+`workflows/others/condenser.py:115`, `llm/prompt_styles/prompt_style_base.py:126,132`).
+Two consequences, both LINDDUN-relevant:
+
+- **PII leakage (default-on).** Query text — potentially personal data — reaches
+  stdout/log files with no opt-in, so this is the *baseline* Data-Disclosure /
+  Unawareness surface, present before any observability is enabled. It is
+  content-lighter than traces but always active.
+- **Worse as an audit substitute.** The INFO query log is **unattributed** (bare
+  query string; no user/tenant/collection), so it cannot support issue-2's
+  cross-session attribution. If logs were repurposed as an audit trail it would
+  incur the same purpose-limitation / Unawareness hazard as reusing tracing
+  (§8.4), *plus* a looser-governance hazard: logs are typically fanned out to
+  aggregation/retention systems with broad operator access and no tenant
+  isolation.
+
+Both tracing and logging are modelled as the existing store `DS-LOGS` /
+`DS-TRACES` in the system model; neither is audit telemetry.
+
 **Consequence for the model.** Issue 2 cannot be analysed against existing
 features alone, because the capability that creates the privacy risk — an
 *attributed, correlatable* record of who queried what collection — **does not
@@ -281,6 +309,10 @@ audit record could be produced without changing the retrieval logic:
   the stream broker when `stream.broker=redis`
   (`components/streaming/stream/registry.py:26-33`), which an external consumer
   could tap.
+- **Application logs** — the lowest-effort option: the INFO query log already
+  exists (§5). It is also the **worst-governed** audit substitute (unattributed,
+  fanned out to log aggregators with broad access and no tenant isolation), so
+  it is noted here as an *anti-pattern* rather than a recommended path.
 
 Whichever insertion point is used, the privacy-relevant design decision is
 **where the resulting audit data lives and who controls it**, because that is
