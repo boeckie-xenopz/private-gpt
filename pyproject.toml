@@ -322,6 +322,14 @@ test = [
     "pytest-cov>=7,<8",
     "pytest-httpx>=0.36.0",
 ]
+# Opt-in behavioural privacy tests with Giskard (doc/giskard-tests-runbook.md).
+# Deliberately a SEPARATE extra: it must never enter the product runtime or the
+# default dev install. Install explicitly: `uv sync --extra test-giskard`.
+# Pin the v3 line (v3 is a rewrite of v2 - see the evaluation doc).
+test-giskard = [
+    "giskard[scan]>=3,<4",
+    "httpx>=0.27",
+]
 typecheck = [
     "types-pyyaml>=6.0.12.12,<7",
     "pika-stubs>=0.1.3,<0.2",

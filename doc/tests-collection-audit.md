@@ -28,11 +28,14 @@ design (**Option B**, backlog P1.3 / P2.5).
 
 ## 1. What is covered and where it lives
 
+> The tests below are the **deterministic, gating** layer. They are complemented by the **opt-in behavioural** Giskard tests in `tests/giskard/` (runbook: [`giskard-tests-runbook.md`](./giskard-tests-runbook.md)), which probe the *assembled system's answers* for cross-collection leakage.
+
 | Area | Source under test | Test file |
 |---|---|---|
 | Collection isolation (retrieval filter) | `private_gpt/components/vector_store/vector_store_component.py` (`get_filters`) | `tests/components/vector_store/test_collection_isolation.py` |
 | Fail-closed isolation + authorisation (P1.1/P1.2) | `private_gpt/components/vector_store/collection_isolation.py` | same file (strict-mode + authorizer tests) |
 | Minimised audit telemetry (Option B) | `private_gpt/components/audit/` | `tests/components/audit/test_audit_recorder.py` |
+| Behavioural / black-box privacy tests (D1-D5) | live PrivateGPT via `POST /v1/messages` | `tests/giskard/` (opt-in; see [`giskard-tests-runbook.md`](./giskard-tests-runbook.md)) |
 
 New source modules added for the mitigations:
 
