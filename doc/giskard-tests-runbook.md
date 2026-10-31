@@ -18,6 +18,7 @@
 1. [What these tests do](#1-what-these-tests-do)
 2. [Prerequisites](#2-prerequisites)
 3. [Install](#3-install)
+   - [3.1 Start a local judge LLM with Docker Compose](#31-start-a-local-judge-llm-with-docker-compose-recommended)
 4. [Prepare the deployment under test](#4-prepare-the-deployment-under-test)
 5. [Environment variables](#5-environment-variables)
 6. [Run the tests locally](#6-run-the-tests-locally)
@@ -52,10 +53,12 @@ product code is modified.
 1. **Python 3.11 + uv** (as for the rest of the repo).
 2. **A running PrivateGPT** reachable over HTTP, configured for **strict
    isolation** (scenario S2) — see §4.
-3. **A judge/embedding LLM for Giskard.** Giskard v3 evaluates each scenario with
-   its own LLM. It can be the same OpenAI-compatible endpoint PrivateGPT uses or
-   a separate one. Keeping it local/in-region keeps canaries from leaving the
-   host (recommended; see the evaluation doc §11).
+3. **A judge/embedding LLM for Giskard.** The "judge" is the **LLM Giskard calls
+   to evaluate each scenario** (`GISKARD_CHECKS_DEFAULT_MODEL`), plus an embedding
+   model for the scans — *not* a Giskard server. It can be the same
+   OpenAI-compatible endpoint PrivateGPT uses, a hosted model, or a **local model
+   started with Docker Compose (§3.1)**. Keeping it local keeps the canary test
+   data from leaving the host (recommended; see the evaluation doc §11).
 4. **The canary corpus ingested** into collections A and B (see §4).
 
 > **Giskard v3 is a rewrite of v2.** The `test-giskard` group pins `giskard[scan]>=3,<4`.
@@ -78,6 +81,53 @@ pip install "giskard[scan]>=3,<4" httpx
 Install the provider extra matching your judge LLM, e.g. `giskard[scan,openai]`,
 `[google]`, `[anthropic]`, `[azure]`, or `[litellm]` for an OpenAI-compatible
 local endpoint via LiteLLM.
+
+### 3.1 Start a local judge LLM with Docker Compose (recommended)
+
+Instead of a hosted model, you can run the judge locally. A compose file is
+provided that starts **Ollama** (an OpenAI-compatible endpoint) and pulls a chat
+model (the judge) and an embedding model (for scans). Because the judge is local,
+the canary test data never leaves your machine — the privacy-preferred option.
+
+> This is **test infrastructure only**. It does not run PrivateGPT and is
+> unrelated to any production deployment.
+
+```bash
+# 1. Start the local judge and pull the models (first run downloads them).
+docker compose -f tests/giskard/docker-compose.judge.yml up -d
+
+# 2. Wait until the one-shot 'judge-init' service has finished pulling models.
+docker compose -f tests/giskard/docker-compose.judge.yml logs -f judge-init
+#   ... "Judge models ready." then the init container exits.
+
+# 3. Point Giskard at the local endpoint (LiteLLM uses the openai/ prefix +
+#    OPENAI_API_BASE for any OpenAI-compatible server).
+export GISKARD_CHECKS_DEFAULT_MODEL=openai/qwen2.5:7b-instruct
+export GISKARD_CHECKS_DEFAULT_EMBEDDING_MODEL=openai/nomic-embed-text
+export OPENAI_API_BASE=http://localhost:11434/v1
+export OPENAI_API_KEY=ollama   # Ollama ignores the value; LiteLLM requires one
+
+# 4. Run the tests (see §6). Teardown when done:
+docker compose -f tests/giskard/docker-compose.judge.yml down   # add -v to drop models
+```
+
+Model choice is configurable without editing the file:
+
+```bash
+GISKARD_JUDGE_CHAT_MODEL=llama3.1:8b-instruct GISKARD_JUDGE_EMBED_MODEL=nomic-embed-text   docker compose -f tests/giskard/docker-compose.judge.yml up -d
+```
+
+Notes:
+- **GPU is optional.** The compose file has a commented NVIDIA block; uncomment it
+  (with the NVIDIA Container Toolkit installed) for GPU acceleration. CPU works
+  for the small default models, just slower.
+- **Resource sizing.** Pick judge models small enough for your CI hardware;
+  `qwen2.5:7b-instruct` + `nomic-embed-text` is a reasonable CPU-friendly default.
+- **Not a native Giskard provider.** Reaching a local OpenAI-compatible endpoint
+  goes through LiteLLM, so install the `litellm` extra
+  (`pip install "giskard[scan,litellm]"`) or use `set_default_generator(LiteLLMGenerator(...))`
+  if the env-based config does not pick up the custom base URL in your Giskard
+  version.
 
 ---
 
@@ -222,6 +272,11 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - name: Install (core + giskard group)
         run: uv sync --extra core --extra vectorstore-qdrant --extra test-giskard
+      - name: Start local Giskard judge (Ollama)   # optional: local, no data egress
+        run: |
+          docker compose -f tests/giskard/docker-compose.judge.yml up -d
+          docker compose -f tests/giskard/docker-compose.judge.yml \
+            logs -f judge-init   # waits for "Judge models ready." then exits
       - name: Start PrivateGPT (strict isolation) + Qdrant
         run: |
           # Bring up the deployment-under-test in S2 config (compose/helm/etc.).
@@ -238,6 +293,12 @@ jobs:
           GISKARD_ENABLED: "1"
           GISKARD_PGPT_BASE_URL: http://localhost:8080
           GISKARD_PGPT_AUTH: ${{ secrets.PGPT_AUTH_HEADER }}
+          # Hosted judge: set these from CI vars/secrets. For the LOCAL compose
+          # judge instead, use:
+          #   GISKARD_CHECKS_DEFAULT_MODEL: openai/qwen2.5:7b-instruct
+          #   GISKARD_CHECKS_DEFAULT_EMBEDDING_MODEL: openai/nomic-embed-text
+          #   OPENAI_API_BASE: http://localhost:11434/v1
+          #   OPENAI_API_KEY: ollama
           GISKARD_CHECKS_DEFAULT_MODEL: ${{ vars.GISKARD_JUDGE_MODEL }}
           GISKARD_CHECKS_DEFAULT_EMBEDDING_MODEL: ${{ vars.GISKARD_EMBED_MODEL }}
           OPENAI_API_KEY: ${{ secrets.JUDGE_LLM_API_KEY }}
@@ -307,6 +368,8 @@ giskard-privacy:
 | Scan errors on judge LLM | Missing `GISKARD_CHECKS_DEFAULT_MODEL` / provider key, or no embedding model for scans. |
 | D5 always skipped | Expected: audit telemetry is not wired into retrieval yet. Set `GISKARD_AUDIT_WIRED=1` only against an audit-aware build. |
 | Symlink / venv error on this filesystem | Use an external venv under `$HOME` (see `tests-collection-audit.md` §2). |
+| Local compose judge: connection refused | Models still pulling — wait for `judge-init` to log "Judge models ready."; check `docker compose -f tests/giskard/docker-compose.judge.yml ps`. |
+| Local judge 404 / model not found | `GISKARD_CHECKS_DEFAULT_MODEL` must use the `openai/` prefix and match a pulled Ollama model; set `OPENAI_API_BASE=http://localhost:11434/v1`. Install the `litellm` extra if the base URL is not picked up. |
 
 ---
 

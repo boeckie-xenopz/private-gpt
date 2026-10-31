@@ -1,0 +1,74 @@
+# Local Giskard "judge" LLM for the privacy tests (doc/giskard-tests-runbook.md).
+#
+# "The Giskard judge" is the LLM Giskard calls to evaluate each scenario
+# (GISKARD_CHECKS_DEFAULT_MODEL) plus an embedding model for the scans. This
+# compose file runs a LOCAL, OpenAI-compatible endpoint (Ollama) so the canary
+# test data never leaves your machine -- the privacy-preferred option from the
+# evaluation doc.
+#
+# This is TEST INFRASTRUCTURE ONLY. It does not run PrivateGPT and is unrelated
+# to any production deployment.
+#
+# Usage:
+#   docker compose -f tests/giskard/docker-compose.judge.yml up -d
+#   # wait until the 'judge-init' service has pulled the models (see logs)
+#   # then point Giskard at it (provider prefix 'openai/' + OPENAI_API_BASE):
+#   export GISKARD_CHECKS_DEFAULT_MODEL=openai/qwen2.5:7b-instruct
+#   export GISKARD_CHECKS_DEFAULT_EMBEDDING_MODEL=openai/nomic-embed-text
+#   export OPENAI_API_BASE=http://localhost:11434/v1
+#   export OPENAI_API_KEY=ollama          # Ollama ignores the value but LiteLLM wants one
+#   # ... then run the tests (see the runbook).
+#
+# Teardown:
+#   docker compose -f tests/giskard/docker-compose.judge.yml down
+#   # add -v to also delete the pulled models volume.
+
+services:
+  judge:
+    image: ollama/ollama:latest
+    container_name: giskard-judge
+    ports:
+      - "11434:11434"          # OpenAI-compatible API at /v1
+    volumes:
+      - judge-models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+    # GPU is optional. To use an NVIDIA GPU, uncomment the block below and
+    # ensure the NVIDIA Container Toolkit is installed.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # One-shot init that pulls the judge + embedding models, then exits.
+  judge-init:
+    image: ollama/ollama:latest
+    container_name: giskard-judge-init
+    depends_on:
+      judge:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: "http://judge:11434"
+      # Override to taste; keep both small enough to run on CI hardware.
+      JUDGE_CHAT_MODEL: "${GISKARD_JUDGE_CHAT_MODEL:-qwen2.5:7b-instruct}"
+      JUDGE_EMBED_MODEL: "${GISKARD_JUDGE_EMBED_MODEL:-nomic-embed-text}"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        echo "Pulling judge chat model: $$JUDGE_CHAT_MODEL" &&
+        ollama pull "$$JUDGE_CHAT_MODEL" &&
+        echo "Pulling judge embedding model: $$JUDGE_EMBED_MODEL" &&
+        ollama pull "$$JUDGE_EMBED_MODEL" &&
+        echo "Judge models ready."
+    restart: "no"
+
+volumes:
+  judge-models:
